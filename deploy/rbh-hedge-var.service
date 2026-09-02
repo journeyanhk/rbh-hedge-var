@@ -1,0 +1,31 @@
+[Unit]
+Description=rbh-hedge-var Phase 1 shadow hedge engine (XAU Variational x RHC Lighter)
+Documentation=https://github.com/journeyanhk/rbh-hedge-var
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE THREE for your host ---
+User=rbh
+WorkingDirectory=/opt/rbh-hedge-var
+ExecStart=/opt/rbh-hedge-var/.venv/bin/python -m rbh_hedge_var run --config config.json
+# --------------------------------------
+Environment=PYTHONUNBUFFERED=1
+# src/ layout: make the package importable without installing
+Environment=PYTHONPATH=/opt/rbh-hedge-var/src
+
+# Restart forever — this also exercises the P0-3 ENTERING/EXITING crash-recovery
+# path we built, so an unattended 1-2 week shadow run is safe.
+Restart=always
+RestartSec=5
+
+# Hardening: Phase 1 only reads public data + writes state/logs under WorkingDirectory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/rbh-hedge-var
+
+[Install]
+WantedBy=multi-user.target
