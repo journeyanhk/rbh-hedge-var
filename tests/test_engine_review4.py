@@ -120,7 +120,7 @@ def test_attested_lighter_interval_reads_state(tmp_path):
 def test_verify_funding_writes_attestation(tmp_path):
     eng = _engine(tmp_path)
     rows = [{"timestamp": 1_700_000_000 + i * 3600, "amount": "0.5"} for i in range(6)]
-    eng.lighter.funding_history = lambda symbol, limit=200: rows
+    eng.lighter.funding_history = lambda symbol, limit=200, auth_token=None: rows
     eng.lighter.funding_rate = lambda symbol: {"rate": D("0.0001")}
     out = eng.verify_funding()
     assert out["ok"] is True
@@ -130,7 +130,7 @@ def test_verify_funding_writes_attestation(tmp_path):
 def test_verify_funding_rejects_bad_cadence(tmp_path):
     eng = _engine(tmp_path)
     rows = [{"timestamp": 1_700_000_000 + i * 14400, "amount": "0.5"} for i in range(6)]
-    eng.lighter.funding_history = lambda symbol, limit=200: rows
+    eng.lighter.funding_history = lambda symbol, limit=200, auth_token=None: rows
     eng.lighter.funding_rate = lambda symbol: {"rate": D("0.0001")}
     out = eng.verify_funding()
     assert out["ok"] is False

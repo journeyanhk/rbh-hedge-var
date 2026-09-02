@@ -187,6 +187,17 @@ class LighterSignerClient:
                 return D(entry) if entry is not None and D(entry) > ZERO else None
         return None
 
+    # ---- private-read auth (positionFunding etc.) --------------------------
+    def auth_token(self) -> str:
+        """Signed auth token for authenticated GET endpoints (e.g.
+        /api/v1/positionFunding). Signs locally via the SDK — no network, no
+        mutation, so the write-guard does not apply. Default ~10-min expiry."""
+        signer = self._signer()
+        auth, err = signer.create_auth_token_with_expiry()
+        if err is not None or not auth:
+            raise LighterSignerError(f"Lighter auth-token creation failed: {err}")
+        return auth
+
 
 def _run(coro: Any) -> Any:
     """Run one SDK coroutine to completion.

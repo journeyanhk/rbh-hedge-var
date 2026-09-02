@@ -521,14 +521,47 @@ class Engine:
             pass
         return D("0.0000001")
 
+    def _funding_auth_token(self) -> str | None:
+        """Signed auth token for the private /api/v1/positionFunding read.
+
+        positionFunding requires auth for a main/sub account. Use the live
+        signer if the stack is built; otherwise construct a throwaway signer
+        from env creds so ``verify-funding`` also works before go-live (it only
+        signs locally, never trades). Returns None if creds are absent — the
+        API then rejects with a clear 'auth empty' message the caller surfaces."""
+        signer = self._lighter_signer
+        if signer is None:
+            try:
+                from .lighter_signer import LighterSignerClient
+                lcfg = self.cfg.get("lighter", {})
+                env_file = lcfg.get("account_env_file", ".env")
+                signer = LighterSignerClient(
+                    base_url=lcfg.get("base_url", "https://api.rh.lighter.xyz"),
+                    chain_id=int(lcfg.get("chain_id", 466324)),
+                    account_index=self.lighter.account_index,
+                    api_key_private_key=read_env(env_file, ("LIGHTER_API_KEY_PRIVATE_KEY",)),
+                    api_key_index=int(read_env(env_file, ("LIGHTER_API_KEY_INDEX",)) or 0),
+                    read_client=self.lighter,
+                )
+            except Exception as exc:
+                self._log(f"[VERIFY-FUNDING] no signer for auth token: {exc}")
+                return None
+        try:
+            return signer.auth_token()
+        except Exception as exc:
+            self._log(f"[VERIFY-FUNDING] auth token failed: {exc}")
+            return None
+
     def verify_funding(self, *, limit: int = 200) -> dict[str, Any]:
         """review4 P0-D: pull REAL Lighter funding settlements, prove the cadence
         is ≈ the configured interval, and persist a time-boxed attestation the
         funding-unit gate accepts in lieu of a published interval. Read-only:
         never disarms or trades. Returns a human-readable result dict."""
         expected = int(self.cfg.get("expected_lighter_funding_interval_s", 3600))
+        auth = self._funding_auth_token()
         try:
-            rows = self.lighter.funding_history(self.lighter_symbol, limit=limit)
+            rows = self.lighter.funding_history(self.lighter_symbol, limit=limit,
+                                                auth_token=auth)
         except Exception as exc:
             return {"ok": False, "reason": f"funding history fetch failed: {exc}"}
         val = funding_attest.validate_settlements(

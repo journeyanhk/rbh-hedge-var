@@ -156,27 +156,35 @@ class LighterReadOnlyClient:
         }
 
     # ---- private funding settlements (review4 P0-D attestation source) -----
-    def funding_history(self, symbol: str, *, limit: int = 200) -> list[dict[str, Any]]:
-        """Real funding-settlement history for the configured account.
+    def funding_history(self, symbol: str, *, limit: int = 100,
+                        auth_token: str | None = None) -> list[dict[str, Any]]:
+        """Real per-position funding-settlement history for the account.
 
         Feeds ``funding_attest.validate_settlements`` so the go-live gate can
         prove Lighter's hourly cadence empirically (Lighter never publishes
-        ``funding_interval_s``). Returns [{"timestamp": <s>, "amount": <usdt>}].
+        ``funding_interval_s``). Returns [{"timestamp": <s>, "amount": <usdt>}]
+        sorted oldest-first.
 
-        REVIEW-REQUIRED: the exact RHC endpoint/param shape must be confirmed
-        against the live API before go-live. Parsing tolerates field-name
-        variants and fails closed (raises on transport error; skips malformed
-        rows) so a wrong shape yields NO attestation rather than a fake one."""
+        Endpoint: ``GET /api/v1/positionFunding`` (the PER-ACCOUNT funding
+        debits/credits — NOT ``/api/v1/fundings``, which is market-wide rate
+        history). Requires a signed ``auth`` token for a main/sub account; pass
+        one from ``LighterSignerClient.auth_token()``. Params: ``account_index``
+        (int), ``market_ids`` (comma-separated, plural), ``limit`` (1..100).
+        Fails closed: raises on transport error; skips malformed rows so a wrong
+        shape yields NO attestation rather than a fake one."""
         if self.account_index is None:
             raise LighterError("account_index required for funding history")
         row = self._market_row(symbol)
-        res = http_util.get_json(
-            self.base_url + "/api/v1/fundings",
-            params={"account_index": str(self.account_index),
-                    "market_id": int(row["market_id"]), "limit": int(limit)},
-        )
-        raw = (res.json.get("fundings") or res.json.get("funding_payments")
-               or res.json.get("payments") or res.json.get("funding_history") or [])
+        params: dict[str, Any] = {
+            "account_index": int(self.account_index),
+            "market_ids": str(int(row["market_id"])),
+            "limit": max(1, min(int(limit), 100)),
+        }
+        if auth_token:
+            params["auth"] = auth_token
+        res = http_util.get_json(self.base_url + "/api/v1/positionFunding", params=params)
+        raw = (res.json.get("position_fundings") or res.json.get("fundings")
+               or res.json.get("funding_payments") or [])
         out: list[dict[str, Any]] = []
         for r in raw:
             if not isinstance(r, dict):
@@ -188,11 +196,13 @@ class LighterReadOnlyClient:
             ts = int(ts)
             if ts > 10_000_000_000:   # ms -> s
                 ts //= 1000
-            amt = (r.get("amount") if r.get("amount") is not None else
+            amt = (r.get("change") if r.get("change") is not None else
+                   r.get("amount") if r.get("amount") is not None else
                    r.get("funding") if r.get("funding") is not None else
                    r.get("payment") if r.get("payment") is not None else
                    r.get("value") if r.get("value") is not None else 0)
             out.append({"timestamp": ts, "amount": D(amt)})
+        out.sort(key=lambda x: x["timestamp"])   # positionFunding is newest-first
         return out
 
     # ---- write surface (blocked in Phase 1) --------------------------------
