@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 from . import economics, net_guard
-from .numeric import D, ZERO
+from .numeric import ZERO, D
 
 
 class ShadowLeg:
@@ -61,7 +61,8 @@ class ShadowExecutor:
     def open_hedge(self, direction: str, notional: Decimal,
                    var_price: Decimal, lit_price: Decimal,
                    lit_size_step: Decimal,
-                   lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None) -> dict[str, Any]:
+                   lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
+                   var_symbol: str = "XAU", lit_symbol: str = "XAU") -> dict[str, Any]:
         assert net_guard.is_armed(), "shadow executor requires the write-guard armed"
 
         if direction == "short_var_long_lighter":
@@ -80,8 +81,8 @@ class ShadowExecutor:
         lit_fill = self._model_price(lit_side, lit_price, lit_levels, lit_qty)
 
         legs = [
-            ShadowLeg("variational", "XAU", var_side, var_qty, var_fill),
-            ShadowLeg("lighter", "XAUT", lit_side, lit_qty, lit_fill),
+            ShadowLeg("variational", var_symbol, var_side, var_qty, var_fill),
+            ShadowLeg("lighter", lit_symbol, lit_side, lit_qty, lit_fill),
         ]
         # Phase-accurate: accept both, then confirm both. A real executor could
         # fail between these; the state machine handles a single-confirmed leg.
@@ -124,3 +125,32 @@ class ShadowExecutor:
                 price_pnl += (entry - exit_price) * qty
             closed.append({**leg, "exit_price": str(exit_price), "closed": True})
         return {"shadow": True, "legs": closed, "price_pnl": price_pnl}
+
+    def mark_to_market(self, legs: list[dict[str, Any]],
+                       var_price: Decimal, lit_price: Decimal,
+                       lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None) -> Decimal:
+        """Unrealized price-leg PnL if we closed right now (P0-2).
+
+        Reuses the exact executable-VWAP close pricing but persists nothing.
+        Returns Decimal USDT (may be negative).
+        """
+        assert net_guard.is_armed(), "shadow executor requires the write-guard armed"
+        price_pnl = ZERO
+        for leg in legs:
+            entry = D(leg["price"])
+            qty = D(leg["qty"])
+            venue = leg["venue"]
+            open_side = leg["side"]
+            close_side = "buy" if open_side == "sell" else "sell"
+            if venue == "lighter":
+                levels = None
+                if lit_book:
+                    levels = lit_book.get("bids") if close_side == "sell" else lit_book.get("asks")
+                exit_price = self._model_price(close_side, lit_price, levels, qty)
+            else:
+                exit_price = self._model_price(close_side, var_price, None, qty)
+            if open_side == "buy":
+                price_pnl += (exit_price - entry) * qty
+            else:
+                price_pnl += (entry - exit_price) * qty
+        return price_pnl

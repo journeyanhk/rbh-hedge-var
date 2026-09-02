@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from .numeric import D, ZERO
+from .numeric import ZERO, D
 
 ACTION_NONE = "none"
 ACTION_FLATTEN_SINGLE_LEG = "flatten_single_leg"

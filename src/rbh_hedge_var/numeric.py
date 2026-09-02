@@ -6,7 +6,7 @@ and transport boundaries convert to str/float.
 """
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, getcontext
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, getcontext
 from typing import Any
 
 getcontext().prec = 40

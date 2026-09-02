@@ -9,14 +9,18 @@
   "variational": {
     "symbol": "XAU",
     "base_url": "https://omni.variational.io",
-    "token_env_file": ".env"
+    "token_env_file": ".env",
+    "funding_unit": "annualized"
   },
   "lighter": {
     "symbol": "XAU",
     "base_url": "https://api.rh.lighter.xyz",
     "chain_id": 466324,
-    "account_env_file": ".env"
+    "account_env_file": ".env",
+    "funding_unit": "per_interval"
   },
+
+  "//funding_unit": "Explicit per-venue funding unit (P1-2). Variational publishes an ANNUALIZED rate; RHC Lighter a per-interval decimal. The magnitude heuristic is now only a mismatch warning, not the source of truth.",
 
   "//direction": "auto = pick side from funding-spread sign each tick (agreed).",
   "direction_mode": "auto",
@@ -49,6 +53,13 @@
   "single_leg_watchdog_enabled": true,
   "max_daily_loss_usdt": 15.0,
   "close_cooldown_seconds": 1200,
+
+  "//alerts": "Telegram alerts for HALT / single-leg / sustained data failure (P0-4). No-op when creds absent. Keys TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in env_file.",
+  "telegram": {
+    "env_file": ".env",
+    "timeout_s": 5
+  },
+  "data_failure_alert_streak": 5,
 
   "poll_interval_seconds": 60,
   "state_file": "state.json",

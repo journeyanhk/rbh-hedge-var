@@ -1,7 +1,12 @@
 import time
 
 from rbh_hedge_var.state_machine import (
-    StateMachine, IDLE, ENTERING, HOLDING, EXITING, COOLDOWN,
+    COOLDOWN,
+    ENTERING,
+    EXITING,
+    HOLDING,
+    IDLE,
+    StateMachine,
 )
 
 
@@ -25,10 +30,13 @@ def test_full_lifecycle(tmp_path):
     sm.begin_exit("reversal")
     assert sm.mode == EXITING
 
-    sm.finish_exit(1.25, "reversal", cooldown_s=1)
+    sm.finish_exit(1.25, 0.75, "reversal", cooldown_s=1)
     assert sm.mode == COOLDOWN
-    assert sm.state["realized_pnl"] == 1.25
+    assert sm.state["realized_pnl"] == 2.0
     assert len(sm.state["round_history"]) == 1
+    assert sm.state["round_history"][0]["price_pnl"] == 1.25
+    assert sm.state["round_history"][0]["funding_pnl"] == 0.75
+    assert sm.state["round_history"][0]["pnl"] == 2.0
 
     # cooldown not elapsed yet
     assert sm.maybe_leave_cooldown() is False
@@ -68,3 +76,51 @@ def test_reversal_streak(tmp_path):
     assert sm.bump_reversal(True) == 1
     assert sm.bump_reversal(True) == 2
     assert sm.bump_reversal(False) == 0
+
+
+def test_funding_accrues_and_books_at_exit(tmp_path):
+    sm = _sm(tmp_path)
+    legs = [{"venue": "variational", "side": "sell", "qty": "2", "price": "4327"},
+            {"venue": "lighter", "side": "buy", "qty": "2", "price": "4323"}]
+    sm.begin_entry("short_var_long_lighter", "signal")
+    sm.confirm_hold(legs)
+    assert sm.funding_accrued() == 0.0
+    sm.accrue_funding(0.5)
+    sm.accrue_funding(0.25)
+    assert sm.funding_accrued() == 0.75
+    sm.begin_exit("reversal")
+    sm.finish_exit(-1.0, sm.funding_accrued(), "reversal", cooldown_s=1)
+    # price leg lost 1.0 but funding earned 0.75 -> net -0.25
+    assert sm.state["realized_pnl"] == -0.25
+    # funding reset for next round
+    assert sm.funding_accrued() == 0.0
+
+
+def test_shadow_rounds_jsonl_is_append_only(tmp_path):
+    import json
+    sm = _sm(tmp_path)
+    legs = [{"venue": "variational", "side": "sell", "qty": "1", "price": "4327"}]
+    for _ in range(3):
+        sm.begin_entry("short_var_long_lighter", "s")
+        sm.confirm_hold(legs)
+        sm.begin_exit("r")
+        sm.finish_exit(0.1, 0.2, "r", cooldown_s=0)
+        sm.maybe_leave_cooldown()
+    ledger = tmp_path / "shadow_rounds.jsonl"
+    lines = [json.loads(x) for x in ledger.read_text().splitlines() if x.strip()]
+    assert len(lines) == 3
+    assert all(r["funding_pnl"] == 0.2 for r in lines)
+
+
+def test_halt_latches_and_clears(tmp_path):
+    sm = _sm(tmp_path)
+    assert sm.is_halted() is False
+    assert sm.set_halt("drawdown") is True     # new halt
+    assert sm.set_halt("drawdown") is False    # already halted -> not new
+    assert sm.is_halted() is True
+    assert sm.halt_reason() == "drawdown"
+    # survives reload
+    sm2 = StateMachine(str(tmp_path / "state.json"))
+    assert sm2.is_halted() is True
+    sm2.clear_halt()
+    assert sm2.is_halted() is False

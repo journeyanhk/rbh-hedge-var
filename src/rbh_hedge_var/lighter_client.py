@@ -21,7 +21,7 @@ from decimal import Decimal
 from typing import Any
 
 from . import http_util
-from .numeric import D, ZERO
+from .numeric import ZERO, D
 
 RHC_BASE_URL = "https://api.rh.lighter.xyz"
 RHC_CHAIN_ID = 466324

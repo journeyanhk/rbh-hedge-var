@@ -11,3 +11,5 @@ logs/
 .venv/
 venv/
 .DS_Store
+
+shadow_rounds.jsonl

@@ -20,7 +20,7 @@ from decimal import Decimal
 from typing import Any
 
 from . import funding_guard
-from .numeric import D, ZERO
+from .numeric import ZERO, D
 
 
 def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
@@ -45,8 +45,15 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
     var_ref = var_int or int(cfg.get("expected_variational_funding_interval_s", 3600))
     lit_ref = lit_int or int(lighter_funding.get("official_interval_s") or
                              cfg.get("expected_lighter_funding_interval_s", 3600))
-    var_hourly = funding_guard.normalize_hourly(var_asset.get("funding_rate"), var_ref)
-    lit_hourly = funding_guard.normalize_hourly(lighter_funding.get("rate"), lit_ref)
+    var_unit = (cfg.get("variational") or {}).get("funding_unit")
+    lit_unit = (cfg.get("lighter") or {}).get("funding_unit")
+    var_hourly = funding_guard.normalize_hourly(var_asset.get("funding_rate"), var_ref, var_unit)
+    lit_hourly = funding_guard.normalize_hourly(lighter_funding.get("rate"), lit_ref, lit_unit)
+    unit_warnings = []
+    if funding_guard.unit_hint_conflicts(var_asset.get("funding_rate"), var_unit):
+        unit_warnings.append(f"variational funding magnitude conflicts with configured unit '{var_unit}'")
+    if funding_guard.unit_hint_conflicts(lighter_funding.get("rate"), lit_unit):
+        unit_warnings.append(f"lighter funding magnitude conflicts with configured unit '{lit_unit}'")
     spread_hourly = None
     if var_hourly is not None and lit_hourly is not None:
         spread_hourly = var_hourly - lit_hourly
@@ -73,6 +80,7 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
         "funding_unit_reason": unit.reason,
         "funding_verified": unit.verified,
         "live_allowed_by_units": unit.live_allowed,
+        "funding_unit_warnings": unit_warnings,
         "lighter_status": lighter_contract.get("status"),
         "lighter_reduce_only": lighter_contract.get("reduce_only"),
     }
@@ -135,6 +143,10 @@ def exit_signal(snap: dict[str, Any], direction: str, cfg: dict[str, Any],
     """Trigger-based exit — never a timer.
 
     Priority: hard basis stop, then confirmed funding-spread reversal.
+
+    `reversal_streak` is the count INCLUDING the current tick (the engine bumps
+    it before calling this). We compare directly against the confirm threshold
+    so there is only one place that owns the counting semantics.
     """
     basis = abs(snap.get("basis") or ZERO)
     if basis > D(cfg.get("force_exit_basis_pct", 0.02)):
@@ -149,8 +161,8 @@ def exit_signal(snap: dict[str, Any], direction: str, cfg: dict[str, Any],
                 or (direction == "short_lighter_long_var" and spread >= ZERO)
             )
             need = int(cfg.get("spread_reversal_confirm_ticks", 3))
-            if reversed_now and reversal_streak + 1 >= need:
-                return True, f"funding_spread_reversal confirmed x{reversal_streak + 1}"
+            if reversed_now and reversal_streak >= need:
+                return True, f"funding_spread_reversal confirmed x{reversal_streak}"
     return False, ""
 
 
@@ -159,6 +171,20 @@ def take_profit_signal(total_pnl: Any, cfg: dict[str, Any]) -> tuple[bool, str]:
     pnl = D(total_pnl)
     if threshold > ZERO and pnl >= threshold:
         return True, f"take_profit {pnl} >= {threshold}"
+    return False, ""
+
+
+def round_stop_loss_signal(total_pnl: Any, cfg: dict[str, Any]) -> tuple[bool, str]:
+    """Per-round stop: total (price + funding) PnL below -max_round_loss_usdt.
+
+    Consumes `max_round_loss_usdt`. Disabled when the config value is <= 0.
+    """
+    limit = D(cfg.get("max_round_loss_usdt", 0) or 0)
+    if limit <= ZERO:
+        return False, ""
+    pnl = D(total_pnl)
+    if pnl <= -limit:
+        return True, f"round_stop_loss {pnl} <= -{limit}"
     return False, ""
 
 

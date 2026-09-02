@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from .numeric import D, ZERO
+from .numeric import D
 
 SECONDS_PER_HOUR = Decimal(3600)
 
@@ -39,27 +39,57 @@ class FundingUnitResult:
         return self.status == "verified"
 
 
-def normalize_hourly(rate: Any, interval_s: int | None) -> Decimal | None:
+def heuristic_is_annualized(rate: Any) -> bool:
+    """Magnitude heuristic: |rate| > 0.01 looks annualized, not per-interval."""
+    return abs(D(rate)) > Decimal("0.01")
+
+
+def normalize_hourly(rate: Any, interval_s: int | None,
+                     unit_hint: str | None = None) -> Decimal | None:
     """Convert a per-interval OR annualized funding rate to a per-hour rate.
 
     Returns None when the interval is unknown — callers must treat None as
     "cannot compute", never as zero.
 
-    Unit heuristic (ported from variational-ondo, validated against live data):
-    Variational's public metadata publishes funding as an ANNUALIZED figure
-    (e.g. ~0.26 == 26% APR), whereas RHC Lighter publishes a small per-interval
-    decimal (e.g. 0.000128). We disambiguate by magnitude: |rate| > 0.01 is
-    treated as annualized and divided by periods-per-year first; otherwise the
-    rate is already per-interval. This is the concrete resolution of the
-    "4h vs 1h / annualized vs per-period"口径 risk flagged in the design review.
+    Unit resolution (P1-2 fix): the venue's unit is taken from ``unit_hint``
+    when provided ("annualized" | "per_interval"/"decimal"). Only when no hint
+    is configured do we fall back to the magnitude heuristic. This removes the
+    ambiguity where a rare 1.5%-per-interval rate could be misread as annualized.
+
+    Validated live (2026-09-02): Variational publishes an ANNUALIZED figure over
+    a 14400s (4h) interval; RHC Lighter publishes a small per-interval decimal.
     """
     if interval_s is None or interval_s <= 0:
         return None
     val = D(rate)
     interval = Decimal(int(interval_s))
     periods_per_year = Decimal(365 * 24 * 60 * 60) / interval
-    per_interval = val / periods_per_year if abs(val) > Decimal("0.01") else val
+    hint = (unit_hint or "").strip().lower()
+    if hint == "annualized":
+        annualized = True
+    elif hint in ("per_interval", "decimal", "per_period"):
+        annualized = False
+    else:
+        annualized = heuristic_is_annualized(val)
+    per_interval = val / periods_per_year if annualized else val
     return per_interval * SECONDS_PER_HOUR / interval
+
+
+def unit_hint_conflicts(rate: Any, unit_hint: str | None) -> bool:
+    """True when a configured unit disagrees with the magnitude heuristic.
+
+    Used to raise a dashboard/log warning (not a hard block) so a misconfigured
+    unit or an extreme market print is surfaced rather than silently trusted.
+    """
+    if not unit_hint:
+        return False
+    hint = unit_hint.strip().lower()
+    heuristic = heuristic_is_annualized(rate)
+    if hint == "annualized":
+        return not heuristic
+    if hint in ("per_interval", "decimal", "per_period"):
+        return heuristic
+    return False
 
 
 def verify_units(

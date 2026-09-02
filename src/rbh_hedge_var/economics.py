@@ -15,7 +15,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from .numeric import D, ZERO
+from .numeric import ZERO, D
 
 
 def executable_vwap(levels: list[tuple[Decimal, Decimal]], target_qty: Decimal) -> Decimal | None:

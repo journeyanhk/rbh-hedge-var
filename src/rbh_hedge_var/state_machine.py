@@ -30,6 +30,11 @@ VALID_TRANSITIONS = {
 }
 
 
+def _utc_day(ts: float | None = None) -> str:
+    """UTC date key (P1-7) so daily PnL aligns with funding settlement (UTC)."""
+    return time.strftime("%Y-%m-%d", time.gmtime(ts if ts is not None else time.time()))
+
+
 def empty_state() -> dict[str, Any]:
     return {
         "mode": IDLE,
@@ -40,9 +45,12 @@ def empty_state() -> dict[str, Any]:
         "cooldown_until": None,
         "reversal_streak": 0,
         "realized_pnl": 0.0,
+        "funding_accrued_usdt": 0.0,   # estimated funding for the open round
+        "funding_last_accrual_ts": None,  # last time funding was accrued (P0-1)
         "daily_pnl": {},
         "round_history": [],
         "shadow": True,
+        "halt": None,                  # {reason, at} once tripped; needs manual clear
         "last_reason": None,
         "last_update": None,
     }
@@ -98,7 +106,23 @@ class StateMachine:
         self.state["round_id"] = int(self.state.get("round_id", 0)) + 1
         self.state["legs"] = legs
         self.state["opened_at"] = int(time.time())
+        self.state["funding_accrued_usdt"] = 0.0
+        self.state["funding_last_accrual_ts"] = int(time.time())
         self.save()
+
+    def accrue_funding(self, amount_usdt: float) -> float:
+        """Add an estimated funding increment to the open round (P0-1).
+
+        Returns the new cumulative funding for the round. Only meaningful while
+        HOLDING; callers gate on mode.
+        """
+        cur = float(self.state.get("funding_accrued_usdt", 0.0)) + float(amount_usdt)
+        self.state["funding_accrued_usdt"] = cur
+        self.save()
+        return cur
+
+    def funding_accrued(self) -> float:
+        return float(self.state.get("funding_accrued_usdt", 0.0))
 
     def abort_entry(self, reason: str) -> None:
         self.transition(IDLE, f"entry_aborted:{reason}")
@@ -109,29 +133,52 @@ class StateMachine:
     def begin_exit(self, reason: str) -> None:
         self.transition(EXITING, reason)
 
-    def finish_exit(self, pnl: float, reason: str, cooldown_s: int) -> None:
+    def finish_exit(self, price_pnl: float, funding_pnl: float, reason: str,
+                    cooldown_s: int) -> None:
+        """Close a round. Round PnL = price leg PnL + accrued funding (P0-1).
+
+        Both components are stored separately in history and in the append-only
+        shadow_rounds.jsonl so the shadow ledger reflects the funding income
+        that is the entire point of the strategy.
+        """
         self.transition(COOLDOWN, reason)
-        day = time.strftime("%Y-%m-%d")
+        total = float(price_pnl) + float(funding_pnl)
+        day = _utc_day()
         self.state.setdefault("daily_pnl", {})
-        self.state["daily_pnl"][day] = float(self.state["daily_pnl"].get(day, 0.0)) + float(pnl)
-        self.state["realized_pnl"] = float(self.state.get("realized_pnl", 0.0)) + float(pnl)
-        history = list(self.state.get("round_history") or [])
-        history.append({
+        self.state["daily_pnl"][day] = float(self.state["daily_pnl"].get(day, 0.0)) + total
+        self.state["realized_pnl"] = float(self.state.get("realized_pnl", 0.0)) + total
+        record = {
             "round_id": self.state.get("round_id"),
             "direction": self.state.get("direction"),
             "opened_at": self.state.get("opened_at"),
             "closed_at": int(time.time()),
             "reason": reason,
-            "pnl": float(pnl),
+            "price_pnl": float(price_pnl),
+            "funding_pnl": float(funding_pnl),
+            "pnl": total,
             "shadow": bool(self.state.get("shadow", True)),
-        })
-        self.state["round_history"] = history[-20:]
+        }
+        history = list(self.state.get("round_history") or [])
+        history.append(record)
+        self.state["round_history"] = history[-20:]     # bounded live view
+        self._append_shadow_round(record)               # unbounded ledger (P1-6)
         self.state["direction"] = None
         self.state["legs"] = []
         self.state["opened_at"] = None
         self.state["reversal_streak"] = 0
+        self.state["funding_accrued_usdt"] = 0.0
         self.state["cooldown_until"] = int(time.time()) + int(cooldown_s)
         self.save()
+
+    def _append_shadow_round(self, record: dict[str, Any]) -> None:
+        """Append-only JSONL ledger next to state.json (P1-6)."""
+        try:
+            p = Path(self.path).parent / "shadow_rounds.jsonl"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass  # ledger is best-effort; never block the state machine
 
     def maybe_leave_cooldown(self) -> bool:
         if self.mode != COOLDOWN:
@@ -152,4 +199,24 @@ class StateMachine:
         return streak
 
     def today_pnl(self) -> float:
-        return float(self.state.get("daily_pnl", {}).get(time.strftime("%Y-%m-%d"), 0.0))
+        return float(self.state.get("daily_pnl", {}).get(_utc_day(), 0.0))
+
+    # ---- halt latch (P1-5) -------------------------------------------------
+    def is_halted(self) -> bool:
+        return bool(self.state.get("halt"))
+
+    def halt_reason(self) -> str | None:
+        h = self.state.get("halt")
+        return h.get("reason") if isinstance(h, dict) else None
+
+    def set_halt(self, reason: str) -> bool:
+        """Latch a HALT. Returns True if this is a NEW halt (for one-shot alert)."""
+        if self.state.get("halt"):
+            return False
+        self.state["halt"] = {"reason": reason, "at": int(time.time())}
+        self.save()
+        return True
+
+    def clear_halt(self) -> None:
+        self.state["halt"] = None
+        self.save()

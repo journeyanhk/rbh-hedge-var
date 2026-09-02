@@ -2,7 +2,9 @@ from decimal import Decimal
 
 from rbh_hedge_var import watchdog as wd
 from rbh_hedge_var.watchdog import (
-    ACTION_NONE, ACTION_FLATTEN_SINGLE_LEG, ACTION_HALT_DRAWDOWN,
+    ACTION_FLATTEN_SINGLE_LEG,
+    ACTION_HALT_DRAWDOWN,
+    ACTION_NONE,
 )
 
 LEGS = [
