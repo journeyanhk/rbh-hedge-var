@@ -246,3 +246,30 @@ class LighterSignerClient:
             raise LighterSignerError(f"Lighter auth-token creation failed: {err}")
         return auth
 
+    # ---- lifecycle ---------------------------------------------------------
+    def close(self) -> None:
+        """Close the SDK's async HTTP session and our dedicated loop.
+
+        The SDK's SignerClient wraps an aiohttp ClientSession; a one-shot
+        command (e.g. verify-funding) otherwise exits with an 'Unclosed client
+        session' warning. Best-effort and idempotent."""
+        signer = self._signer_obj
+        if signer is not None:
+            try:
+                closer = getattr(signer, "close", None)
+                if callable(closer):
+                    self._loop_run(closer())
+                else:
+                    api = getattr(signer, "api_client", None)
+                    if api is not None and hasattr(api, "close"):
+                        self._loop_run(api.close())
+            except Exception:
+                pass
+        if self._loop is not None:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+        self._loop = None
+        self._signer_obj = None
+

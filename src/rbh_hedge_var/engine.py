@@ -66,6 +66,7 @@ class Engine:
         self._live_executor = None
         self._var_gateway = None
         self._lighter_signer = None
+        self._throwaway_signer = None
         if self.live_trading:
             self._build_live_stack(vcfg, lcfg, acct_index)
         self.sm = StateMachine(cfg.get("state_file", "state.json"))
@@ -543,6 +544,7 @@ class Engine:
                     api_key_index=int(read_env(env_file, ("LIGHTER_API_KEY_INDEX",)) or 0),
                     read_client=self.lighter,
                 )
+                self._throwaway_signer = signer   # tracked so close() frees it
             except Exception as exc:
                 self._log(f"[VERIFY-FUNDING] no signer for auth token: {exc}")
                 return None
@@ -551,6 +553,18 @@ class Engine:
         except Exception as exc:
             self._log(f"[VERIFY-FUNDING] auth token failed: {exc}")
             return None
+
+    def close(self) -> None:
+        """Release the Lighter signer's async HTTP session(s). For one-shot CLI
+        commands (verify-funding) so the process exits without an 'Unclosed
+        client session' warning. Safe to call when nothing was built."""
+        for sig in (self._lighter_signer, getattr(self, "_throwaway_signer", None)):
+            if sig is not None and hasattr(sig, "close"):
+                try:
+                    sig.close()
+                except Exception:
+                    pass
+        self._throwaway_signer = None
 
     def verify_funding(self, *, limit: int = 200) -> dict[str, Any]:
         """review4 P0-D: pull REAL Lighter funding settlements, prove the cadence

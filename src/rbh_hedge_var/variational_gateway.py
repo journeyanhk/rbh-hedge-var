@@ -41,10 +41,9 @@ VAR_BASE_URL = "https://omni.variational.io"
 _DEFAULT_PATHS = {
     "indicative": "/api/quotes/indicative",
     "order": "/api/orders/new/market",
-    "positions": "/api/account/positions",
-    # legacy hmac-scheme aliases (kept so an operator can pin either):
-    "request_quote": "/api/rfq/quote",
-    "accept_quote": "/api/rfq/accept",
+    "accept": "/api/quotes/accept",
+    "positions": "/api/positions",        # vo var_api.py get_positions — real endpoint
+    "portfolio": "/api/portfolio",        # account balance/margin (preflight can reuse)
 }
 
 # A returned order is ACCEPTED, not filled. Only these terminal states are worth

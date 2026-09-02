@@ -140,7 +140,10 @@ def cmd_verify_funding(cfg) -> int:
     persist a time-boxed attestation the funding-unit gate can accept."""
     eng = Engine(cfg)
     limit = int(cfg.get("funding_history_limit", 200))
-    result = eng.verify_funding(limit=limit)
+    try:
+        result = eng.verify_funding(limit=limit)
+    finally:
+        eng.close()   # release the signer's aiohttp session (one-shot command)
     print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
     return 0 if result.get("ok") else 1
 

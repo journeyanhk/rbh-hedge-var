@@ -11,13 +11,9 @@
     "base_url": "https://omni.variational.io",
     "token_env_file": ".env",
     "funding_unit": "annualized",
-    "//phase2_auth": "Order gateway reads VARIATIONAL_API_KEY / VARIATIONAL_API_SECRET from token_env_file. paths + impersonate are REVIEW-REQUIRED: pin to Variational's real private RFQ API before go-live.",
-    "impersonate": true,
-    "paths": {
-      "request_quote": "/api/rfq/quote",
-      "accept_quote": "/api/rfq/accept",
-      "positions": "/api/account/positions"
-    }
+    "//phase2_auth": "Order gateway uses the token scheme: a browser-session Bearer token (VARIATIONAL_TOKEN) against omni.variational.io, verified live in vo. Endpoint paths are the review4 defaults (/api/quotes/indicative, /api/orders/new/market, /api/positions, /api/portfolio) — do NOT re-pin a `paths` override unless the real API moves. Variational's official Trading API is not yet public, so token+frontend endpoints are the only working route.",
+    "auth_scheme": "token",
+    "impersonate": true
   },
   "lighter": {
     "symbol": "XAU",

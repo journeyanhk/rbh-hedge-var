@@ -167,11 +167,13 @@ class LighterReadOnlyClient:
 
         Endpoint: ``GET /api/v1/positionFunding`` (the PER-ACCOUNT funding
         debits/credits — NOT ``/api/v1/fundings``, which is market-wide rate
-        history). Requires a signed ``auth`` token for a main/sub account; pass
+        history). Requires a signed auth token for a main/sub account, passed as
+        the ``authorization`` header (matches grid-bot's lighter adapter); pass
         one from ``LighterSignerClient.auth_token()``. Params: ``account_index``
         (int), ``market_ids`` (comma-separated, plural), ``limit`` (1..100).
-        Fails closed: raises on transport error; skips malformed rows so a wrong
-        shape yields NO attestation rather than a fake one."""
+        Fails closed: raises on transport error OR an error-coded response (so an
+        'auth required' body can never be silently read as zero settlements);
+        skips malformed rows so a wrong shape yields NO attestation."""
         if self.account_index is None:
             raise LighterError("account_index required for funding history")
         row = self._market_row(symbol)
@@ -180,11 +182,23 @@ class LighterReadOnlyClient:
             "market_ids": str(int(row["market_id"])),
             "limit": max(1, min(int(limit), 100)),
         }
-        if auth_token:
-            params["auth"] = auth_token
-        res = http_util.get_json(self.base_url + "/api/v1/positionFunding", params=params)
-        raw = (res.json.get("position_fundings") or res.json.get("fundings")
-               or res.json.get("funding_payments") or [])
+        headers = {"authorization": auth_token} if auth_token else None
+        from urllib.parse import urlencode
+        url = self.base_url + "/api/v1/positionFunding?" + urlencode(params)
+        # GET is non-mutating, so net_guard permits it even while armed; use
+        # request_json for header + Cloudflare-impersonation support.
+        res = http_util.request_json("GET", url, headers=headers, impersonate=True)
+        body = res.json if isinstance(res.json, dict) else {}
+        # Surface auth/param failures loudly instead of returning an empty list:
+        # a 4xx or an error `code` (Lighter success is code==200) means the query
+        # did NOT run, which is different from "account has no settlements yet".
+        code = body.get("code")
+        if res.status >= 400 or (code is not None and int(code) != 200):
+            msg = body.get("message") or (res.text or "")[:200]
+            raise LighterError(
+                f"positionFunding failed (HTTP {res.status}, code {code}): {msg}")
+        raw = (body.get("position_fundings") or body.get("fundings")
+               or body.get("funding_payments") or [])
         out: list[dict[str, Any]] = []
         for r in raw:
             if not isinstance(r, dict):
