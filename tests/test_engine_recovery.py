@@ -32,6 +32,16 @@ def _engine(tmp_path, **over):
     # market move (live XAU != the hard-coded leg price) flips the sign of the
     # entry baseline and makes the suite flaky.
     eng._safe_book = lambda: None
+    # Hermetic: the lighter contract (size step, decimals) is a live REST call.
+    # Unit tests assert on fixed legs, so pin a deterministic offline contract.
+    eng.lighter.public_contract = lambda symbol: {
+        "venue": "lighter", "symbol": str(symbol).upper(), "market_id": 0,
+        "mark_price": Decimal("4320"), "index_price": Decimal("4320"),
+        "last_price": Decimal("4320"), "size_decimals": 4, "price_decimals": 2,
+        "min_base_amount": Decimal("0"), "min_quote_amount": Decimal("0"),
+        "maker_fee": Decimal("0"), "taker_fee": Decimal("0"),
+        "multiplier": Decimal("1"), "status": "active", "reduce_only": False,
+    }
     return eng
 
 
