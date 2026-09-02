@@ -91,3 +91,49 @@ def test_signed_position_sums_symbol():
     ])
     c = _client(read=read)
     assert c.signed_position("XAU") == D("2.0")
+
+
+def test_auth_token_passes_api_key_index():
+    class Sig:
+        def create_auth_token_with_expiry(self, deadline=-1, *, api_key_index=255):
+            return (f"tok:{api_key_index}", None)
+    c = _client(signer=Sig())
+    assert c.auth_token() == "tok:0"
+
+
+def test_auth_token_raises_on_error():
+    class Sig:
+        def create_auth_token_with_expiry(self, deadline=-1, *, api_key_index=255):
+            return (None, "signer offline")
+    c = _client(signer=Sig())
+    with pytest.raises(LighterSignerError):
+        c.auth_token()
+
+
+def test_signer_construction_adapts_to_sdk_signature(monkeypatch):
+    """Regression: the installed SignerClient takes api_private_keys={idx: pk},
+    not private_key=... . _signer() must inspect the real signature and build
+    matching kwargs instead of crashing on an unexpected keyword."""
+    import sys
+    import types
+
+    seen = {}
+
+    class NewStyleSigner:  # mirrors current lighter-python constructor
+        def __init__(self, url, account_index, api_private_keys,
+                     nonce_management_type=None, chain_id=None):
+            seen.update(url=url, account_index=account_index,
+                        api_private_keys=api_private_keys, chain_id=chain_id)
+
+    fake_mod = types.ModuleType("lighter")
+    fake_mod.SignerClient = NewStyleSigner
+    monkeypatch.setitem(sys.modules, "lighter", fake_mod)
+
+    # signer_factory=None so the real SDK-import path runs against our fake
+    c = LighterSignerClient(
+        base_url="https://api.rh.lighter.xyz", chain_id=466324, account_index=7,
+        api_key_private_key="pk", api_key_index=3, read_client=FakeRead())
+    c._signer()
+    assert seen["account_index"] == 7
+    assert seen["api_private_keys"] == {3: "pk"}
+    assert seen["chain_id"] == 466324

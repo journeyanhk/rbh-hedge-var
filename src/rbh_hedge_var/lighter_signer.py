@@ -83,12 +83,27 @@ class LighterSignerClient:
             raise LighterSignerError(
                 "lighter-python SDK not installed; `pip install lighter-python` to go live"
             ) from exc
-        self._signer_obj = SignerClient(
-            url=self.base_url,
-            private_key=self._pk,
-            account_index=self.account_index,
-            api_key_index=self._api_key_index,
-        )
+        # SignerClient's constructor changed across SDK versions: older builds
+        # take (url, private_key, account_index, api_key_index); newer builds
+        # take (url, account_index, api_private_keys={index: pk}, chain_id).
+        # Inspect the actual installed signature and build kwargs to match,
+        # rather than guessing and crashing on an unexpected-keyword error.
+        import inspect
+        params = inspect.signature(SignerClient.__init__).parameters
+        kwargs: dict[str, Any] = {"url": self.base_url, "account_index": self.account_index}
+        if "api_private_keys" in params:
+            kwargs["api_private_keys"] = {self._api_key_index: self._pk}
+        elif "private_key" in params:
+            kwargs["private_key"] = self._pk
+            if "api_key_index" in params:
+                kwargs["api_key_index"] = self._api_key_index
+        else:
+            raise LighterSignerError(
+                "unrecognized lighter SignerClient signature "
+                f"({list(params)}) — cannot pass the API private key")
+        if "chain_id" in params:
+            kwargs["chain_id"] = self.chain_id
+        self._signer_obj = SignerClient(**kwargs)
         return self._signer_obj
 
     # ---- sizing (fail-closed) ---------------------------------------------
@@ -192,8 +207,15 @@ class LighterSignerClient:
         """Signed auth token for authenticated GET endpoints (e.g.
         /api/v1/positionFunding). Signs locally via the SDK — no network, no
         mutation, so the write-guard does not apply. Default ~10-min expiry."""
+        import inspect
         signer = self._signer()
-        auth, err = signer.create_auth_token_with_expiry()
+        make = signer.create_auth_token_with_expiry
+        # Newer SDKs key auth by api_key_index (default 255); pass ours so the
+        # token is signed with the key we actually loaded. Older SDKs omit it.
+        if "api_key_index" in inspect.signature(make).parameters:
+            auth, err = make(api_key_index=self._api_key_index)
+        else:
+            auth, err = make()
         if err is not None or not auth:
             raise LighterSignerError(f"Lighter auth-token creation failed: {err}")
         return auth
