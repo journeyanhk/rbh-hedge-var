@@ -16,7 +16,7 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
-from . import economics, net_guard
+from . import economics, net_guard, pricing
 from .numeric import ZERO, D
 
 
@@ -49,14 +49,7 @@ class ShadowExecutor:
 
     def _model_price(self, side: str, ref_price: Decimal,
                      book: list[tuple[Decimal, Decimal]] | None, qty: Decimal) -> Decimal:
-        vwap = None
-        if book:
-            vwap = economics.executable_vwap(book, qty)
-        base = vwap if vwap is not None else ref_price
-        # taker crosses the spread: buys pay up, sells receive less
-        if side == "buy":
-            return base * (D(1) + self.slippage)
-        return base * (D(1) - self.slippage)
+        return pricing.model_fill_price(side, ref_price, book, qty, self.slippage)
 
     def open_hedge(self, direction: str, notional: Decimal,
                    var_price: Decimal, lit_price: Decimal,
@@ -135,22 +128,4 @@ class ShadowExecutor:
         Returns Decimal USDT (may be negative).
         """
         assert net_guard.is_armed(), "shadow executor requires the write-guard armed"
-        price_pnl = ZERO
-        for leg in legs:
-            entry = D(leg["price"])
-            qty = D(leg["qty"])
-            venue = leg["venue"]
-            open_side = leg["side"]
-            close_side = "buy" if open_side == "sell" else "sell"
-            if venue == "lighter":
-                levels = None
-                if lit_book:
-                    levels = lit_book.get("bids") if close_side == "sell" else lit_book.get("asks")
-                exit_price = self._model_price(close_side, lit_price, levels, qty)
-            else:
-                exit_price = self._model_price(close_side, var_price, None, qty)
-            if open_side == "buy":
-                price_pnl += (exit_price - entry) * qty
-            else:
-                price_pnl += (entry - exit_price) * qty
-        return price_pnl
+        return pricing.mark_to_market_legs(legs, var_price, lit_price, lit_book, self.slippage)

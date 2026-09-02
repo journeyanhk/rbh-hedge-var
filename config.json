@@ -10,14 +10,22 @@
     "symbol": "XAU",
     "base_url": "https://omni.variational.io",
     "token_env_file": ".env",
-    "funding_unit": "annualized"
+    "funding_unit": "annualized",
+    "//phase2_auth": "Order gateway reads VARIATIONAL_API_KEY / VARIATIONAL_API_SECRET from token_env_file. paths + impersonate are REVIEW-REQUIRED: pin to Variational's real private RFQ API before go-live.",
+    "impersonate": true,
+    "paths": {
+      "request_quote": "/api/rfq/quote",
+      "accept_quote": "/api/rfq/accept",
+      "positions": "/api/account/positions"
+    }
   },
   "lighter": {
     "symbol": "XAU",
     "base_url": "https://api.rh.lighter.xyz",
     "chain_id": 466324,
     "account_env_file": ".env",
-    "funding_unit": "per_interval"
+    "funding_unit": "per_interval",
+    "//phase2_signer": "SignerClient reads LIGHTER_API_KEY_PRIVATE_KEY / LIGHTER_API_KEY_INDEX / LIGHTER_ACCOUNT_INDEX from account_env_file. Requires `pip install lighter-python` on the live host."
   },
 
   "//funding_unit": "Explicit per-venue funding unit (P1-2). Variational publishes an ANNUALIZED rate; RHC Lighter a per-interval decimal. The magnitude heuristic is now only a mismatch warning, not the source of truth.",

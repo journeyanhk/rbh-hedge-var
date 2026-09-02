@@ -52,6 +52,10 @@ and the network write-guard stays armed.
 
 ## 6. Final arming
 - [ ] All boxes above checked.
+- [ ] `docs/PHASE2_STATUS.md` REVIEW-REQUIRED items (Variational REST paths +
+      signing, Lighter SDK method surface, nonce, fill confirmation) verified.
 - [ ] `live_trading=true` **and** `funding_verified=true` at runtime.
-- [ ] Live executor calls `net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")`
-      explicitly (no other code path may).
+- [ ] `python3 run.py preflight` is all-green (except the expected armed-guard row).
+- [ ] `run` disarms only via the explicit opt-in
+      `RBH_HEDGE_LIVE_ARM=I_UNDERSTAND_LIVE_TRADING` after `preflight` passes;
+      no other code path calls `net_guard.disarm`.

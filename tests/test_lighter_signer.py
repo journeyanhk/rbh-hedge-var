@@ -1,0 +1,93 @@
+"""LighterSignerClient — guard enforcement, scaling, fill normalization."""
+import pytest
+
+from rbh_hedge_var import net_guard
+from rbh_hedge_var.lighter_signer import LighterSignerClient, LighterSignerError
+from rbh_hedge_var.net_guard import WriteBlockedError
+from rbh_hedge_var.numeric import D
+
+
+def setup_function():
+    net_guard.arm()
+
+
+def teardown_function():
+    net_guard.arm()
+
+
+class FakeRead:
+    def __init__(self, positions=None):
+        self._positions = positions or []
+
+    def public_contract(self, symbol):
+        return {"market_id": 40, "size_decimals": 4, "price_decimals": 2}
+
+    def account_snapshot(self):
+        return {"positions": self._positions}
+
+
+class FakeSigner:
+    def __init__(self):
+        self.calls = []
+
+    def create_market_order(self, **kw):
+        self.calls.append(kw)
+        return ({"tx": 1}, "0xabc", None)
+
+    def cancel_all_orders(self):
+        return ({}, "0xdef", None)
+
+
+def _client(read=None, signer=None):
+    return LighterSignerClient(
+        base_url="https://api.rh.lighter.xyz", chain_id=466324, account_index=7,
+        api_key_private_key="pk", api_key_index=0,
+        read_client=read or FakeRead(), signer_factory=(lambda: signer) if signer else None)
+
+
+def test_place_order_blocked_while_armed():
+    c = _client(signer=FakeSigner())
+    with pytest.raises(WriteBlockedError):
+        c.place_market_order("XAU", "buy", D("2.7"), D("4320"))
+
+
+def test_scaled_amounts_uses_decimals():
+    c = _client()
+    amt = c.scaled_amounts("XAU", D("2.76543"), D("4320.12"))
+    # size_decimals=4 -> 2.7654 * 1e4 = 27654 (floored); price_decimals=2 -> 432012
+    assert amt["base_amount"] == 27654
+    assert amt["price_scaled"] == 432012
+    assert amt["market_index"] == 40
+
+
+def test_place_order_when_disarmed_calls_signer():
+    signer = FakeSigner()
+    c = _client(signer=signer)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = c.place_market_order("XAU", "buy", D("2.7"), D("4320"))
+    assert out["venue"] == "lighter" and out["side"] == "buy"
+    assert out["tx_hash"] == "0xabc"
+    # buy is_ask False; slippage-protected limit above ref
+    call = signer.calls[0]
+    assert call["is_ask"] is False
+    assert call["base_amount"] == 27000  # 2.7 * 1e4
+
+
+def test_place_order_propagates_signer_error():
+    class Bad(FakeSigner):
+        def create_market_order(self, **kw):
+            return (None, None, "insufficient margin")
+    c = _client(signer=Bad())
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(LighterSignerError):
+        c.place_market_order("XAU", "sell", D("2.7"), D("4320"))
+
+
+def test_signed_position_sums_symbol():
+    read = FakeRead(positions=[
+        {"symbol": "XAU", "qty": D("2.7")},
+        {"symbol": "XAU", "qty": D("-0.7")},
+        {"symbol": "ETH", "qty": D("5")},
+    ])
+    c = _client(read=read)
+    assert c.signed_position("XAU") == D("2.0")

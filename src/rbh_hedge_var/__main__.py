@@ -1,11 +1,19 @@
 """CLI entrypoint.
 
-Commands (all read-only / shadow in Phase 1):
+Commands:
   probe        one-shot data + economics snapshot, prints JSON, exits
   once         run a single engine tick and print the result
   run          run the engine loop + monitor until interrupted
   guard-check  print net-guard status (proves writes are blocked)
   clear-halt   clear a latched drawdown HALT and reset PnL counters
+  reconcile    (Phase 2) print real signed positions on both venues
+  preflight    (Phase 2) go-live readiness table; never disarms/trades
+
+Live execution (Phase 2) is OFF unless ALL hold:
+  * config.live_trading = true
+  * every `preflight` check passes
+  * env RBH_HEDGE_LIVE_ARM=I_UNDERSTAND_LIVE_TRADING is set for `run`
+Absent any of these the engine runs in shadow (no orders).
 
 Usage:
   python -m rbh_hedge_var <command> [--config config.json]
@@ -13,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 
@@ -20,6 +29,8 @@ from . import net_guard
 from .config import load_config
 from .engine import Engine, _display
 from .monitor import serve
+
+LIVE_ARM_TOKEN = "I_UNDERSTAND_LIVE_TRADING"
 
 
 def _cfg_path(argv: list[str]) -> str:
@@ -74,14 +85,65 @@ def cmd_clear_halt(cfg) -> int:
     return 0
 
 
+def cmd_reconcile(cfg) -> int:
+    eng = Engine(cfg)
+    if eng._var_gateway is None:
+        print(json.dumps({"live_stack": False,
+                          "message": "no live gateways (config.live_trading false or creds missing)"}, indent=2))
+        return 1
+    from .reconcile import ReconcileError, reconcile_positions
+    try:
+        live = reconcile_positions(eng.lighter_symbol, lighter_read=eng.lighter,
+                                   var_gateway=eng._var_gateway)
+    except ReconcileError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        return 1
+    print(json.dumps({"ok": True, "symbol": eng.lighter_symbol,
+                      "positions": {k: str(v) for k, v in live.items()}}, indent=2))
+    return 0
+
+
+def cmd_preflight(cfg) -> int:
+    eng = Engine(cfg)
+    checks = eng.preflight()
+    all_ok = all(c["ok"] for c in checks if c["check"] != "write_guard_armed")
+    for c in checks:
+        mark = "PASS" if c["ok"] else "FAIL"
+        print(f"[{mark}] {c['check']:24s} {c['detail']}")
+    print("\n" + ("READY to disarm (all trade-gates pass)." if all_ok
+                  else "NOT ready: resolve FAIL rows before going live."))
+    return 0 if all_ok else 1
+
+
+def _maybe_arm_live(cfg, eng) -> bool:
+    """Disarm the write-guard ONLY when the operator has opted in explicitly AND
+    preflight passes. Returns True if live orders are now enabled."""
+    if not cfg.get("live_trading"):
+        return False
+    if os.environ.get("RBH_HEDGE_LIVE_ARM") != LIVE_ARM_TOKEN:
+        print("[run] live_trading=true but RBH_HEDGE_LIVE_ARM not set -> staying SHADOW.", flush=True)
+        return False
+    checks = eng.preflight()
+    gate = [c for c in checks if c["check"] != "write_guard_armed"]
+    if not all(c["ok"] for c in gate):
+        failed = [c["check"] for c in gate if not c["ok"]]
+        print(f"[run] preflight FAILED {failed} -> staying SHADOW.", flush=True)
+        return False
+    net_guard.disarm(LIVE_ARM_TOKEN)
+    print("[run] 🔴 WRITE-GUARD DISARMED — LIVE ORDERS ENABLED.", flush=True)
+    return True
+
+
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
+    live = _maybe_arm_live(cfg, eng)
     serve(cfg.get("state_file", "state.json"),
           get_snapshot=lambda: _display(eng.last_snapshot),
           host=cfg.get("monitor_bind", "127.0.0.1"),
           port=int(cfg.get("monitor_port", 8012)))
     interval = int(cfg.get("poll_interval_seconds", 60))
-    print(f"[run] shadow engine started; poll={interval}s. Ctrl-C to stop.", flush=True)
+    mode = "LIVE" if live else "shadow"
+    print(f"[run] {mode} engine started; poll={interval}s. Ctrl-C to stop.", flush=True)
     try:
         while True:
             result = eng.tick()
@@ -109,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_guard_check(cfg)
     if command == "clear-halt":
         return cmd_clear_halt(cfg)
+    if command == "reconcile":
+        return cmd_reconcile(cfg)
+    if command == "preflight":
+        return cmd_preflight(cfg)
     print(f"unknown command: {command}\n{__doc__}")
     return 2
 

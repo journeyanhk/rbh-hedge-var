@@ -22,8 +22,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from . import economics, net_guard, strategy, watchdog
-from .config import env_int
+from . import economics, net_guard, reconcile, strategy, watchdog
+from .config import env_int, read_env
 from .lighter_client import LighterReadOnlyClient
 from .numeric import ZERO, D, fmt
 from .shadow_executor import ShadowExecutor
@@ -36,8 +36,15 @@ SECONDS_PER_HOUR = D(3600)
 
 class Engine:
     def __init__(self, cfg: dict[str, Any]) -> None:
-        net_guard.arm()  # belt-and-suspenders: always read-only in Phase 1
         self.cfg = cfg
+        self.live_trading = bool(cfg.get("live_trading"))
+        # Phase 1 (and any non-live config) force the write-guard armed. When
+        # live_trading is configured we leave the guard in its current state so
+        # an operator's explicit `go-live` disarm can persist; the guard still
+        # defaults to armed on a fresh process, so a restart re-blocks orders
+        # until the go-live gate is re-passed.
+        if not self.live_trading:
+            net_guard.arm()
         vcfg = cfg.get("variational", {})
         lcfg = cfg.get("lighter", {})
         self.var = VariationalReadOnlyClient(
@@ -53,12 +60,59 @@ class Engine:
         self.var_symbol = vcfg.get("symbol", "XAU")
         self.lighter_symbol = lcfg.get("symbol", "XAU")   # P1-1: RHC market is XAU
         self.executor = ShadowExecutor(cfg)
+        # Live execution wiring (Phase 2). Built only when live_trading is on;
+        # constructing the gateways never disarms the guard or sends anything.
+        self._live_executor = None
+        self._var_gateway = None
+        self._lighter_signer = None
+        if self.live_trading:
+            self._build_live_stack(vcfg, lcfg, acct_index)
         self.sm = StateMachine(cfg.get("state_file", "state.json"))
         self.tg = TelegramNotifier(cfg)
         self.notional = D(cfg.get("notional_per_leg_usdt", 12000))
         self.last_snapshot: dict[str, Any] = {}
         self.last_error: str | None = None
         self._data_fail_streak = 0
+
+    def _build_live_stack(self, vcfg: dict[str, Any], lcfg: dict[str, Any],
+                          acct_index: int | None) -> None:
+        """Construct the Phase 2 order gateways + live executor. Fail-closed: if
+        credentials are absent we log and stay in shadow rather than crash, so a
+        misconfigured live deploy degrades safely instead of trading blind."""
+        from .lighter_signer import LighterSignerClient
+        from .live_executor import LiveExecutor
+        from .variational_gateway import VariationalOrderGateway
+        try:
+            env_file = lcfg.get("account_env_file", ".env")
+            self._lighter_signer = LighterSignerClient(
+                base_url=lcfg.get("base_url", "https://api.rh.lighter.xyz"),
+                chain_id=int(lcfg.get("chain_id", 466324)),
+                account_index=acct_index,
+                api_key_private_key=read_env(env_file, ("LIGHTER_API_KEY_PRIVATE_KEY",)),
+                api_key_index=int(read_env(env_file, ("LIGHTER_API_KEY_INDEX",)) or 0),
+                read_client=self.lighter,
+            )
+            self._var_gateway = VariationalOrderGateway(
+                base_url=vcfg.get("base_url", "https://omni.variational.io"),
+                symbol=vcfg.get("symbol", "XAU"),
+                env_file=vcfg.get("token_env_file", ".env"),
+                cfg=vcfg,
+            )
+            self._live_executor = LiveExecutor(
+                self.cfg, lighter_signer=self._lighter_signer, var_gateway=self._var_gateway)
+        except Exception as exc:
+            self._live_executor = None
+            self._log(f"[LIVE INIT] gateway build failed -> staying shadow: {exc}")
+
+    def _executor_for(self, shadow: bool) -> Any:
+        """Pick the executor for an open round by its persisted shadow flag so a
+        live round is always closed by the live executor even if live gating
+        flickers mid-round."""
+        if shadow:
+            return self.executor
+        if self._live_executor is None:
+            raise RuntimeError("live round persisted but no live executor available")
+        return self._live_executor
 
     # ---- data --------------------------------------------------------------
     def fetch_snapshot(self) -> dict[str, Any]:
@@ -161,7 +215,6 @@ class Engine:
         elif mode == HOLDING:
             action = self._hold_tick(snap)
 
-        self.sm.state["shadow"] = True
         self.sm.save()
         return {"ok": True, "mode": self.sm.mode, "action": action, "snapshot": _display(snap)}
 
@@ -193,7 +246,8 @@ class Engine:
         funding_pnl = D(self.sm.funding_accrued())
 
         # P0-2: mark-to-market the price legs, combine with funding.
-        price_pnl = self.executor.mark_to_market(
+        executor = self._executor_for(bool(self.sm.state.get("shadow", True)))
+        price_pnl = executor.mark_to_market(
             legs, snap.get("var_price") or ZERO, snap.get("lighter_price") or ZERO, book,
         )
         total_pnl = price_pnl + funding_pnl
@@ -240,9 +294,14 @@ class Engine:
 
     # ---- entry / exit ------------------------------------------------------
     def _do_entry(self, direction: str, reason: str, snap: dict[str, Any]) -> str:
-        # Live gate — Phase 1 always resolves to shadow.
-        live = bool(self.cfg.get("live_trading")) and bool(snap.get("live_allowed_by_units"))
+        # Live gate — resolve to the live executor ONLY when every condition
+        # holds: live_trading configured, funding units allow it, the unit is
+        # VERIFIED (if required), a live executor exists, AND the write-guard is
+        # disarmed. Any failure falls back to the shadow executor (no orders).
+        live = self.live_trading and bool(snap.get("live_allowed_by_units"))
         if live and self.cfg.get("require_funding_unit_verified_for_live", True) and not snap.get("funding_verified"):
+            live = False
+        if live and (self._live_executor is None or net_guard.is_armed()):
             live = False
 
         # P1-3: size step MUST come from size_decimals; refuse entry otherwise.
@@ -257,26 +316,38 @@ class Engine:
             self._log(f"[ENTRY BLOCKED] bad size_decimals={size_decimals!r}")
             return "entry_blocked:bad_size_decimals"
 
+        executor = self._executor_for(shadow=not live)
+        mode_tag = "LIVE" if live else "SHADOW"
         self.sm.begin_entry(direction, reason)
         book = self._safe_book()
-        result = self.executor.open_hedge(
-            direction, self.notional,
-            snap.get("var_price") or ZERO, snap.get("lighter_price") or ZERO,
-            size_step, book,
-            var_symbol=self.var_symbol, lit_symbol=self.lighter_symbol,
-        )
+        try:
+            result = executor.open_hedge(
+                direction, self.notional,
+                snap.get("var_price") or ZERO, snap.get("lighter_price") or ZERO,
+                size_step, book,
+                var_symbol=self.var_symbol, lit_symbol=self.lighter_symbol,
+            )
+        except Exception as exc:
+            # A live entry can raise (single leg flattened, quote rejected). Roll
+            # the state back to IDLE and let the next tick re-evaluate.
+            self.sm.abort_entry(f"open_failed:{type(exc).__name__}")
+            self._log(f"[{mode_tag} OPEN FAILED] {exc}")
+            self._alert(f"⚠️ {mode_tag} entry failed: {exc}")
+            return f"entry_error:{type(exc).__name__}"
         if result.get("both_filled"):
             self.sm.confirm_hold(result["legs"])
+            self.sm.state["shadow"] = bool(result.get("shadow", not live))
             # Baseline the sunk roundtrip cost so the per-round stop-loss measures
             # deterioration RELATIVE to open, not the model's fixed entry cost.
-            entry_mtm = self.executor.mark_to_market(
+            entry_mtm = executor.mark_to_market(
                 result["legs"], snap.get("var_price") or ZERO,
                 snap.get("lighter_price") or ZERO, book,
             )
             self.sm.set_entry_baseline(float(entry_mtm))
-            self._log(f"[SHADOW OPEN] {direction} {reason} | be_hours={fmt(snap.get('break_even_hours'),2)} "
+            self.sm.save()
+            self._log(f"[{mode_tag} OPEN] {direction} {reason} | be_hours={fmt(snap.get('break_even_hours'),2)} "
                       f"entry_mtm={fmt(entry_mtm,4)}")
-            return f"shadow_open:{direction}"
+            return f"{'live' if live else 'shadow'}_open:{direction}"
         self.sm.abort_entry("leg_not_filled")
         return "entry_aborted"
 
@@ -302,7 +373,8 @@ class Engine:
             return f"exit_deferred:{reason}"
         legs = self.sm.state.get("legs") or []
         book = self._safe_book()
-        result = self.executor.close_hedge(legs, var_price, lit_price, book)
+        executor = self._executor_for(bool(self.sm.state.get("shadow", True)))
+        result = executor.close_hedge(legs, var_price, lit_price, book)
         price_pnl = float(result.get("price_pnl") or 0)
         funding_pnl = self.sm.funding_accrued()   # P0-1: booked separately
         self.sm.finish_exit(price_pnl, funding_pnl, reason,
@@ -328,12 +400,82 @@ class Engine:
         except Exception:
             return None
 
-    def _live_positions(self) -> dict[str, Decimal] | None:
-        """Phase 1: no live reconciliation source -> None (watchdog returns OK).
+    def preflight(self) -> list[dict[str, Any]]:
+        """Go-live readiness checks. Read-only; never disarms or trades. Returns
+        a list of {check, ok, detail} so the CLI can print a pass/fail table.
 
-        Phase 2 replaces this with real signed positions from both venues.
-        """
-        return None
+        Every check must pass before an operator disarms the write-guard."""
+        checks: list[dict[str, Any]] = []
+
+        def add(name: str, ok: bool, detail: str) -> None:
+            checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+        add("live_trading_configured", self.live_trading,
+            "config.live_trading" + ("=true" if self.live_trading else "=false (stays shadow)"))
+        add("live_stack_built", self._live_executor is not None,
+            "gateways constructed" if self._live_executor is not None else "gateways missing/failed")
+
+        # Credentials present (do not print secrets).
+        lcfg = self.cfg.get("lighter", {})
+        vcfg = self.cfg.get("variational", {})
+        lit_pk = read_env(lcfg.get("account_env_file", ".env"), ("LIGHTER_API_KEY_PRIVATE_KEY",))
+        var_key = read_env(vcfg.get("token_env_file", ".env"), ("VARIATIONAL_API_KEY",))
+        var_sec = read_env(vcfg.get("token_env_file", ".env"), ("VARIATIONAL_API_SECRET",))
+        add("lighter_signer_key", bool(lit_pk), "LIGHTER_API_KEY_PRIVATE_KEY present" if lit_pk else "missing")
+        add("variational_api_creds", bool(var_key and var_sec),
+            "VARIATIONAL_API_KEY/SECRET present" if (var_key and var_sec) else "missing")
+
+        # Lighter SDK importable.
+        try:
+            import lighter  # type: ignore  # noqa: F401
+            add("lighter_sdk_installed", True, "lighter-python importable")
+        except Exception:
+            add("lighter_sdk_installed", False, "pip install lighter-python on this host")
+
+        # Funding unit verified from a fresh snapshot.
+        try:
+            snap = self.fetch_snapshot()
+            add("funding_unit_verified", bool(snap.get("funding_verified")),
+                str(snap.get("funding_unit_reason")))
+        except Exception as exc:
+            add("funding_unit_verified", False, f"snapshot failed: {exc}")
+
+        # Book flat (no residual position on either venue) — safe cold start.
+        if self._var_gateway is not None:
+            try:
+                live = reconcile.reconcile_positions(
+                    self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+                flat = all(abs(D(v)) <= D("0.0000001") for v in live.values())
+                add("book_flat", flat, f"positions={ {k: str(v) for k, v in live.items()} }")
+            except Exception as exc:
+                add("book_flat", False, f"reconcile failed: {exc}")
+        else:
+            add("book_flat", False, "no gateway to reconcile")
+
+        # Guard currently armed = orders still blocked (expected until operator disarms).
+        add("write_guard_armed", net_guard.is_armed(),
+            "orders blocked (disarm to go live)" if net_guard.is_armed() else "DISARMED — orders WILL send")
+        return checks
+
+    def _live_positions(self) -> dict[str, Decimal] | None:
+        """Real signed positions from both venues for the single-leg watchdog.
+
+        Only meaningful for a LIVE round (state.shadow == False): a shadow round
+        has no exchange footprint, so we return None and the watchdog treats it
+        as balanced. For a live round we reconcile both venues; if EITHER read
+        fails we return a sentinel imbalance so the watchdog flags it rather than
+        silently assuming balanced (fail closed — an unknown leg is dangerous)."""
+        if bool(self.sm.state.get("shadow", True)) or self._var_gateway is None:
+            return None
+        try:
+            return reconcile.reconcile_positions(
+                self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+        except reconcile.ReconcileError as exc:
+            self._log(f"[RECONCILE] failed -> watchdog will flag imbalance: {exc}")
+            self._alert(f"⚠️ Position reconcile failed: {exc}")
+            # Sentinel imbalance: report both flat so check_single_leg sees the
+            # expected legs unmatched and forces a protective exit.
+            return {"variational": ZERO, "lighter": ZERO}
 
     def _note_data_failure(self, detail: str) -> None:
         self._data_fail_streak += 1
