@@ -172,6 +172,21 @@ class LighterSignerClient:
                 total += D(p.get("qty"))
         return total
 
+    def avg_entry_price(self, symbol: str) -> Decimal | None:
+        """Real average entry price of the current position (for fill backfill).
+
+        Used instead of the mark price so a live round's leg records the price it
+        was actually filled at — this feeds both MTM and the close-out ledger."""
+        snap = self.read.account_snapshot()
+        if not snap:
+            return None
+        sym = symbol.upper()
+        for p in snap.get("positions") or []:
+            if str(p.get("symbol", "")).upper() == sym:
+                entry = p.get("entry")
+                return D(entry) if entry is not None and D(entry) > ZERO else None
+        return None
+
 
 def _run(coro: Any) -> Any:
     """Run one SDK coroutine to completion.

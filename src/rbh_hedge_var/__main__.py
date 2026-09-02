@@ -8,6 +8,7 @@ Commands:
   clear-halt   clear a latched drawdown HALT and reset PnL counters
   reconcile    (Phase 2) print real signed positions on both venues
   preflight    (Phase 2) go-live readiness table; never disarms/trades
+  verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
 
 Live execution (Phase 2) is OFF unless ALL hold:
   * config.live_trading = true
@@ -134,6 +135,16 @@ def _maybe_arm_live(cfg, eng) -> bool:
     return True
 
 
+def cmd_verify_funding(cfg) -> int:
+    """review4 P0-D: prove Lighter's funding cadence from real settlements and
+    persist a time-boxed attestation the funding-unit gate can accept."""
+    eng = Engine(cfg)
+    limit = int(cfg.get("funding_history_limit", 200))
+    result = eng.verify_funding(limit=limit)
+    print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
     live = _maybe_arm_live(cfg, eng)
@@ -146,8 +157,19 @@ def cmd_run(cfg) -> int:
     print(f"[run] {mode} engine started; poll={interval}s. Ctrl-C to stop.", flush=True)
     try:
         while True:
-            result = eng.tick()
-            print(f"[tick] mode={result.get('mode')} action={result.get('action') or result.get('error')}", flush=True)
+            # P1-6: a tick raising must never kill the loop silently. Catch,
+            # log, alert (best-effort Telegram), and keep polling.
+            try:
+                result = eng.tick()
+                print(f"[tick] mode={result.get('mode')} "
+                      f"action={result.get('action') or result.get('error')}", flush=True)
+            except Exception as exc:
+                msg = f"{type(exc).__name__}: {exc}"
+                print(f"[tick] UNCAUGHT {msg}", flush=True)
+                try:
+                    eng.tg.send(f"⚠️ engine tick crashed (loop continues): {msg}")
+                except Exception:
+                    pass
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n[run] stopped.", flush=True)
@@ -175,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reconcile(cfg)
     if command == "preflight":
         return cmd_preflight(cfg)
+    if command == "verify-funding":
+        return cmd_verify_funding(cfg)
     print(f"unknown command: {command}\n{__doc__}")
     return 2
 

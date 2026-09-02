@@ -52,6 +52,7 @@ def empty_state() -> dict[str, Any]:
         "round_history": [],
         "shadow": True,
         "halt": None,                  # {reason, at} once tripped; needs manual clear
+        "funding_attestation": None,   # review4 P0-D: time-boxed cadence proof per venue
         "last_reason": None,
         "last_update": None,
     }
@@ -231,6 +232,16 @@ class StateMachine:
     def clear_halt(self) -> None:
         self.state["halt"] = None
         self.save()
+
+    # ---- funding attestation (review4 P0-D) --------------------------------
+    def set_funding_attestation(self, att: dict[str, Any] | None) -> None:
+        """Persist a time-boxed funding-settlement attestation (or clear it)."""
+        self.state["funding_attestation"] = att
+        self.save()
+
+    def funding_attestation(self) -> dict[str, Any] | None:
+        att = self.state.get("funding_attestation")
+        return att if isinstance(att, dict) else None
 
     def clear_halt_and_ledger(self) -> dict[str, Any]:
         """Clear the HALT latch AND zero the in-memory PnL counters so the next

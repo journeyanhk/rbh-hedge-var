@@ -98,7 +98,18 @@ def verify_units(
     *,
     expected_var_s: int,
     expected_lighter_s: int,
+    lighter_attested_interval_s: int | None = None,
 ) -> FundingUnitResult:
+    # review4 P0-D: RHC Lighter never publishes an interval, which would weld the
+    # live gate shut. A valid private funding attestation (proven cadence from
+    # real settlements, see funding_attest) may supply the interval in its place.
+    attested_used = False
+    if lighter_interval_s is None and lighter_attested_interval_s:
+        try:
+            lighter_interval_s = int(lighter_attested_interval_s)
+            attested_used = True
+        except (TypeError, ValueError):
+            lighter_interval_s = None
     if var_interval_s is None or lighter_interval_s is None:
         missing = []
         if var_interval_s is None:
@@ -135,7 +146,9 @@ def verify_units(
         )
     return FundingUnitResult(
         status="verified",
-        reason="both intervals published and match config",
+        reason=("both intervals match config"
+                + (" (lighter via funding attestation)" if attested_used else
+                   "; both intervals published")),
         var_interval_s=var_interval_s,
         lighter_interval_s=lighter_interval_s,
         live_allowed=True,

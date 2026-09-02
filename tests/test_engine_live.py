@@ -39,18 +39,35 @@ def _snap(**kw):
 class FakeVarGw:
     def __init__(self):
         self.calls = []
+        self.pos = D("0")
 
-    def place_taker_order(self, side, qty, symbol="XAU", reduce_only=False, max_slippage_pct=D("0.002")):
+    def submit_market_order(self, side, qty, *, symbol="XAU", reduce_only=False,
+                            max_slippage_pct=D("0.002")):
         self.calls.append((side, reduce_only))
-        return {"filled_qty": qty, "filled_price": D("4330"), "order_id": "vo"}
+        self.pos += D(qty) if side == "buy" else -D(qty)
+        return {"venue": "variational", "symbol": symbol, "side": side,
+                "rfq_id": "r1", "status": "accepted", "terminal_ok": False}
 
     def signed_position(self, symbol):
-        return D("-2.7")
+        return self.pos
+
+    def avg_entry_price(self, symbol):
+        return D("4330")
 
 
 class FakeLitSigner:
+    def __init__(self):
+        self.pos = D("0")
+
     def place_market_order(self, symbol, side, qty, ref_price, reduce_only=False, slippage_pct=D("0.002")):
+        self.pos += D(qty) if side == "buy" else -D(qty)
         return {"client_order_index": 1, "tx_hash": "0x"}
+
+    def signed_position(self, symbol):
+        return self.pos
+
+    def avg_entry_price(self, symbol):
+        return D("4320")
 
 
 def _engine(tmp_path, live=True):
@@ -58,6 +75,8 @@ def _engine(tmp_path, live=True):
     cfg["state_file"] = str(tmp_path / "state.json")
     cfg["log_file"] = str(tmp_path / "log.log")
     cfg["live_trading"] = live
+    cfg["fill_confirm_timeout_s"] = 1
+    cfg["fill_confirm_poll_s"] = 0
     eng = Engine(cfg)
     # inject fakes + a fixed size_decimals contract, bypass network
     eng._var_gateway = FakeVarGw()
@@ -92,6 +111,7 @@ def test_entry_goes_live_when_disarmed_and_gated(tmp_path):
 def test_live_positions_reconciles_for_live_round(tmp_path):
     eng = _engine(tmp_path, live=True)
     eng.sm.state["shadow"] = False
+    eng._var_gateway.pos = D("-2.7")
     eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("2.7")}]}
     live = eng._live_positions()
     assert live == {"lighter": D("2.7"), "variational": D("-2.7")}

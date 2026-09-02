@@ -155,6 +155,46 @@ class LighterReadOnlyClient:
             "positions": positions,
         }
 
+    # ---- private funding settlements (review4 P0-D attestation source) -----
+    def funding_history(self, symbol: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Real funding-settlement history for the configured account.
+
+        Feeds ``funding_attest.validate_settlements`` so the go-live gate can
+        prove Lighter's hourly cadence empirically (Lighter never publishes
+        ``funding_interval_s``). Returns [{"timestamp": <s>, "amount": <usdt>}].
+
+        REVIEW-REQUIRED: the exact RHC endpoint/param shape must be confirmed
+        against the live API before go-live. Parsing tolerates field-name
+        variants and fails closed (raises on transport error; skips malformed
+        rows) so a wrong shape yields NO attestation rather than a fake one."""
+        if self.account_index is None:
+            raise LighterError("account_index required for funding history")
+        row = self._market_row(symbol)
+        res = http_util.get_json(
+            self.base_url + "/api/v1/fundings",
+            params={"account_index": str(self.account_index),
+                    "market_id": int(row["market_id"]), "limit": int(limit)},
+        )
+        raw = (res.json.get("fundings") or res.json.get("funding_payments")
+               or res.json.get("payments") or res.json.get("funding_history") or [])
+        out: list[dict[str, Any]] = []
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            ts = (r.get("timestamp") or r.get("ts") or r.get("time")
+                  or r.get("settled_at") or r.get("funding_timestamp"))
+            if ts is None:
+                continue
+            ts = int(ts)
+            if ts > 10_000_000_000:   # ms -> s
+                ts //= 1000
+            amt = (r.get("amount") if r.get("amount") is not None else
+                   r.get("funding") if r.get("funding") is not None else
+                   r.get("payment") if r.get("payment") is not None else
+                   r.get("value") if r.get("value") is not None else 0)
+            out.append({"timestamp": ts, "amount": D(amt)})
+        return out
+
     # ---- write surface (blocked in Phase 1) --------------------------------
     def place_market_order(self, *args: Any, **kwargs: Any):
         raise LighterError("Phase 1 read-only client cannot place orders (Phase 2 feature)")

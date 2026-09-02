@@ -1,4 +1,9 @@
-"""LiveExecutor — guard, fill ordering, single-leg rollback, MTM parity."""
+"""LiveExecutor — guard, position-confirmed fills, single-leg rollback, MTM parity.
+
+review4 P0-A: fills are proven by polling the venue signed position vs a
+pre-trade baseline, NOT by return values. The fakes below model that: an order
+moves an internal signed position, so ``_confirm_delta`` observes a real delta.
+"""
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -6,12 +11,14 @@ from pathlib import Path
 import pytest
 
 from rbh_hedge_var import net_guard
-from rbh_hedge_var.live_executor import LiveExecutionError, LiveExecutor
+from rbh_hedge_var.live_executor import LiveExecutionError, LiveExecutor, NakedLegError
 from rbh_hedge_var.net_guard import WriteBlockedError
-from rbh_hedge_var.numeric import D
+from rbh_hedge_var.numeric import ZERO, D
 from rbh_hedge_var.shadow_executor import ShadowExecutor
 
 CFG = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text())
+# make the confirmation loop instant in tests
+CFG = {**CFG, "fill_confirm_timeout_s": 1, "fill_confirm_poll_s": 0}
 
 
 def setup_function():
@@ -23,27 +30,53 @@ def teardown_function():
 
 
 class FakeVar:
-    def __init__(self, fill_price="4330"):
-        self.calls = []
-        self.fill_price = fill_price
+    """Position-tracking Variational fake. submit_market_order moves self.pos so
+    the executor's reconciliation confirms the fill. ``fill_fraction`` < 1 models
+    a partial fill (review4 P0-A partial-fill safety)."""
 
-    def place_taker_order(self, side, qty, symbol="XAU", reduce_only=False, max_slippage_pct=D("0.002")):
-        self.calls.append({"side": side, "qty": qty, "reduce_only": reduce_only})
+    def __init__(self, entry="4330", fill_fraction=D("1")):
+        self.calls = []
+        self.pos = ZERO
+        self.entry = D(entry)
+        self.fill_fraction = D(fill_fraction)
+
+    def submit_market_order(self, side, qty, *, symbol="XAU", reduce_only=False,
+                            max_slippage_pct=D("0.002")):
+        filled = D(qty) * self.fill_fraction
+        self.calls.append({"side": side, "qty": D(qty), "filled": filled,
+                           "reduce_only": reduce_only})
+        self.pos += filled if side == "buy" else -filled
         return {"venue": "variational", "symbol": symbol, "side": side,
-                "filled_qty": qty, "filled_price": D(self.fill_price), "order_id": "vo1"}
+                "rfq_id": "r1", "status": "accepted", "terminal_ok": False}
+
+    def signed_position(self, symbol="XAU"):
+        return self.pos
+
+    def avg_entry_price(self, symbol="XAU"):
+        return self.entry
 
 
 class FakeLighter:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, entry="4320"):
         self.calls = []
+        self.pos = ZERO
         self.fail = fail
+        self.entry = D(entry)
 
-    def place_market_order(self, symbol, side, qty, ref_price, reduce_only=False, slippage_pct=D("0.002")):
-        self.calls.append({"symbol": symbol, "side": side, "qty": qty, "reduce_only": reduce_only})
+    def place_market_order(self, symbol, side, qty, ref_price, reduce_only=False,
+                           slippage_pct=D("0.002")):
+        self.calls.append({"symbol": symbol, "side": side, "qty": D(qty),
+                           "reduce_only": reduce_only})
         if self.fail:
             raise RuntimeError("sequencer rejected")
-        return {"venue": "lighter", "symbol": symbol, "side": side,
-                "client_order_index": 123, "tx_hash": "0xlit"}
+        self.pos += D(qty) if side == "buy" else -D(qty)
+        return {"venue": "lighter", "symbol": symbol, "side": side, "tx_hash": "0xlit"}
+
+    def signed_position(self, symbol="XAU"):
+        return self.pos
+
+    def avg_entry_price(self, symbol="XAU"):
+        return self.entry
 
 
 def _exec(var=None, lit=None):
@@ -56,35 +89,79 @@ def test_open_blocked_while_armed():
                            D("0.0001"), None)
 
 
-def test_open_fills_var_first_then_lighter():
+def test_open_confirms_var_first_then_hedges_lighter():
     var, lit = FakeVar(), FakeLighter()
     ex = _exec(var, lit)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
                         D("0.0001"), None)
     assert out["both_filled"] is True and out["shadow"] is False
-    # var short, lighter long
-    assert var.calls[0]["side"] == "sell"
-    assert lit.calls[0]["side"] == "buy"
+    assert var.calls[0]["side"] == "sell"   # var short first
+    assert lit.calls[0]["side"] == "buy"    # lighter long hedge
     legs = {leg["venue"]: leg for leg in out["legs"]}
+    # real fill prices come from avg_entry_price, not the mark
     assert legs["variational"]["price"] == "4330"
+    assert legs["lighter"]["price"] == "4320"
     assert legs["lighter"]["filled"] is True
+
+
+def test_open_hedges_actual_partial_var_fill():
+    # Variational only fills half -> Lighter must hedge the ACTUAL filled qty.
+    var, lit = FakeVar(fill_fraction=D("0.5")), FakeLighter()
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), None)
+    legs = {leg["venue"]: leg for leg in out["legs"]}
+    # lighter qty matches the actual (partial) variational fill within a step
+    assert abs(D(legs["lighter"]["qty"]) - D(legs["variational"]["qty"])) <= D("0.0001")
+    assert abs(var.pos) > ZERO and abs(lit.pos) > ZERO
 
 
 def test_open_rolls_back_var_when_lighter_fails():
     var, lit = FakeVar(), FakeLighter(fail=True)
     ex = _exec(var, lit)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
-    with pytest.raises(LiveExecutionError):
+    with pytest.raises(NakedLegError):
         ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
                       D("0.0001"), None)
     # var opened sell, then flattened with a reduce_only buy
-    assert var.calls[0] == {"side": "sell", "qty": var.calls[0]["qty"], "reduce_only": False}
+    assert var.calls[0]["side"] == "sell" and var.calls[0]["reduce_only"] is False
     assert var.calls[-1]["side"] == "buy" and var.calls[-1]["reduce_only"] is True
+    # rollback returned Variational to flat
+    assert abs(var.pos) <= D("0.0001")
+
+
+def test_open_flatten_failure_screams():
+    # Lighter hedge fails AND the Variational flatten also fails -> loud NakedLeg.
+    class DeadVar(FakeVar):
+        def submit_market_order(self, side, qty, *, symbol="XAU", reduce_only=False,
+                                max_slippage_pct=D("0.002")):
+            if reduce_only:
+                raise RuntimeError("flatten venue down")
+            return super().submit_market_order(side, qty, symbol=symbol,
+                                                reduce_only=reduce_only)
+
+    ex = _exec(DeadVar(), FakeLighter(fail=True))
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(NakedLegError):
+        ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                      D("0.0001"), None)
+
+
+def test_open_raises_when_var_unconfirmed():
+    var, lit = FakeVar(fill_fraction=D("0")), FakeLighter()
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(LiveExecutionError):
+        ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                      D("0.0001"), None)
+    # never hedged on Lighter since the var leg never confirmed
+    assert lit.calls == []
 
 
 def test_close_closes_variational_first():
-    var, lit = FakeVar(fill_price="4325"), FakeLighter()
+    var, lit = FakeVar(entry="4325"), FakeLighter()
     ex = _exec(var, lit)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     legs = [

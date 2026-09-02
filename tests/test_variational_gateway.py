@@ -1,4 +1,9 @@
-"""VariationalOrderGateway — guard, creds, RFQ fill normalization, positions."""
+"""VariationalOrderGateway — guard, creds, order acceptance, positions.
+
+review4 P0-A/P0-B: an order response is an ACCEPTANCE, never a proven fill, so
+the gateway returns {rfq_id, status, ref_price, terminal_ok} and leaves fill
+truth to position reconciliation. Token Bearer transport is the default scheme.
+"""
 import pytest
 
 from rbh_hedge_var import net_guard
@@ -15,57 +20,64 @@ def teardown_function():
     net_guard.arm()
 
 
-def _gw(monkeypatch, creds=True):
-    gw = VariationalOrderGateway(symbol="XAU", env_file=".env")
-    gw._api_key = "k" if creds else ""
-    gw._api_secret = "s" if creds else ""
+def _gw(monkeypatch, creds=True, scheme="token"):
+    gw = VariationalOrderGateway(symbol="XAU", env_file=".env", cfg={"auth_scheme": scheme})
+    if creds:
+        gw._token = "t"
+        gw._api_key = "k"
+        gw._api_secret = "s"
+    else:
+        gw._token = ""
+        gw._api_key = ""
+        gw._api_secret = ""
     return gw
 
 
-def test_place_blocked_while_armed(monkeypatch):
+def test_submit_blocked_while_armed(monkeypatch):
     gw = _gw(monkeypatch)
     with pytest.raises(WriteBlockedError):
-        gw.place_taker_order("sell", D("2.7"))
+        gw.submit_market_order("sell", D("2.7"))
 
 
 def test_missing_creds_fail_closed(monkeypatch):
     gw = _gw(monkeypatch, creds=False)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     with pytest.raises(VariationalGatewayError):
-        gw.place_taker_order("sell", D("2.7"))
+        gw.submit_market_order("sell", D("2.7"))
 
 
-def test_place_taker_order_happy_path(monkeypatch):
+def test_submit_returns_acceptance_not_trusted_fill(monkeypatch):
     gw = _gw(monkeypatch)
     posts = []
 
     def fake_post(path, body):
         posts.append((path, body))
-        if "quote" in path:
-            return {"quote_id": "q1", "price": "4330.5"}
-        return {"status": "filled", "filled_quantity": "2.7", "fill_price": "4330.4", "order_id": "o1"}
+        if "indicative" in path:
+            return {"price": "4330.5"}
+        return {"rfq_id": "r1", "status": "accepted", "fill_price": "4330.4"}
 
     monkeypatch.setattr(gw, "_post", fake_post)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
-    out = gw.place_taker_order("sell", D("2.7"), symbol="XAU")
-    assert out["filled_qty"] == D("2.7")
-    assert out["filled_price"] == D("4330.4")
-    assert out["order_id"] == "o1"
-    assert len(posts) == 2  # request_quote then accept_quote
+    out = gw.submit_market_order("sell", D("2.7"), symbol="XAU")
+    assert out["rfq_id"] == "r1"
+    assert out["ref_price"] == D("4330.5")
+    # "accepted" is NOT a terminal fill -> must not be trusted as filled.
+    assert out["terminal_ok"] is False
+    assert len(posts) == 2  # indicative then order
 
 
-def test_place_taker_order_unfilled_raises(monkeypatch):
+def test_submit_rejected_raises(monkeypatch):
     gw = _gw(monkeypatch)
 
     def fake_post(path, body):
-        if "quote" in path:
-            return {"quote_id": "q1", "price": "4330"}
-        return {"status": "rejected", "filled_quantity": "0"}
+        if "indicative" in path:
+            return {"price": "4330"}
+        return {"rfq_id": "r1", "status": "rejected"}
 
     monkeypatch.setattr(gw, "_post", fake_post)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     with pytest.raises(VariationalGatewayError):
-        gw.place_taker_order("sell", D("2.7"))
+        gw.submit_market_order("sell", D("2.7"))
 
 
 def test_signed_position_short_is_negative(monkeypatch):
@@ -73,3 +85,11 @@ def test_signed_position_short_is_negative(monkeypatch):
     monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: {
         "positions": [{"asset": "XAU", "side": "short", "net_quantity": "2.7"}]})
     assert gw.signed_position("XAU") == D("-2.7")
+
+
+def test_avg_entry_price_reads_row(monkeypatch):
+    gw = _gw(monkeypatch)
+    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: {
+        "positions": [{"asset": "XAU", "side": "short", "net_quantity": "2.7",
+                       "avg_entry_price": "4331.2"}]})
+    assert gw.avg_entry_price("XAU") == D("4331.2")

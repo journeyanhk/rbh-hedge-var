@@ -22,9 +22,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from . import economics, net_guard, reconcile, strategy, watchdog
+from . import economics, funding_attest, net_guard, reconcile, strategy, watchdog
 from .config import env_int, read_env
 from .lighter_client import LighterReadOnlyClient
+from .live_executor import NakedLegError
 from .numeric import ZERO, D, fmt
 from .shadow_executor import ShadowExecutor
 from .state_machine import COOLDOWN, ENTERING, EXITING, HOLDING, IDLE, StateMachine
@@ -73,6 +74,8 @@ class Engine:
         self.last_snapshot: dict[str, Any] = {}
         self.last_error: str | None = None
         self._data_fail_streak = 0
+        self._reconcile_fail_streak = 0
+        self._idle_tick_count = 0
 
     def _build_live_stack(self, vcfg: dict[str, Any], lcfg: dict[str, Any],
                           acct_index: int | None) -> None:
@@ -131,6 +134,9 @@ class Engine:
             data_errors["lighter"] = f"{type(exc).__name__}: {exc}"
             lit_contract = {"symbol": self.lighter_symbol, "mark_price": ZERO, "status": None}
             lit_funding = {"rate": ZERO, "funding_interval_s": None, "official_interval_s": 3600}
+        # review4 P0-D: inject a valid funding attestation so verify_units can
+        # reach VERIFIED even though Lighter never publishes an interval.
+        self.cfg["_attested_lighter_interval_s"] = self._attested_lighter_interval()
         snap = strategy.market_snapshot(var_asset, lit_contract, lit_funding, self.cfg)
         snap["data_errors"] = data_errors
 
@@ -157,12 +163,13 @@ class Engine:
     def tick(self) -> dict[str, Any]:
         # 1) Crash-restart recovery (P0-3): resolve a persisted ENTERING/EXITING
         #    before trading. Skip while halted (no trading actions when halted).
+        #    review4 P0-C: a LIVE round must reconcile real positions before it
+        #    can abort, or a naked leg stays invisible.
         if not self.sm.is_halted():
             if self.sm.mode == ENTERING:
-                self.sm.abort_entry("recovered_after_restart")
-                self._log("[RECOVERY] ENTERING found on boot -> abort_entry (shadow)")
+                self._recover(ENTERING)
             elif self.sm.mode == EXITING:
-                self._recover_exit()
+                self._recover(EXITING)
 
         # 2) Always fetch market data FIRST so the dashboard stays live even under
         #    a HALT (review3: HALT must not freeze the snapshot to a row of "-").
@@ -206,6 +213,13 @@ class Engine:
 
         mode = self.sm.mode
         if mode == IDLE:
+            # review4 P0-C: while live, periodically prove the book is actually
+            # flat between rounds — a residual leg from a botched abort would
+            # otherwise never be seen (watchdog only runs while HOLDING).
+            halt_action = self._idle_flat_check()
+            if halt_action:
+                return {"ok": True, "mode": self.sm.mode, "halt": self.sm.halt_reason(),
+                        "action": halt_action, "snapshot": _display(snap)}
             should, direction, reason = strategy.entry_signal(snap, self.cfg)
             if should:
                 action = self._do_entry(direction, reason, snap)
@@ -327,6 +341,16 @@ class Engine:
                 size_step, book,
                 var_symbol=self.var_symbol, lit_symbol=self.lighter_symbol,
             )
+        except NakedLegError as exc:
+            # review4 P0-A/P0-C: a leg may be live and the auto-flatten failed.
+            # Do NOT roll back to IDLE as if nothing happened — latch HALT so a
+            # human reconciles the book before any further trading.
+            reason = f"naked_leg:{type(exc).__name__}"
+            self.sm.set_halt(reason)
+            self._log(f"[{mode_tag} NAKED LEG] {exc} -> HALT")
+            self._alert(f"🛑 HALT: {mode_tag} entry left a naked leg: {exc}. "
+                        f"Flatten manually, then `clear-halt`.")
+            return f"entry_naked_leg:{type(exc).__name__}"
         except Exception as exc:
             # A live entry can raise (single leg flattened, quote rejected). Roll
             # the state back to IDLE and let the next tick re-evaluate.
@@ -379,19 +403,159 @@ class Engine:
         funding_pnl = self.sm.funding_accrued()   # P0-1: booked separately
         self.sm.finish_exit(price_pnl, funding_pnl, reason,
                             int(self.cfg.get("close_cooldown_seconds", 1200)))
-        self._log(f"[SHADOW CLOSE] {reason} | price_pnl={fmt(price_pnl,4)} "
+        # P1-5: tag the ledger line by the round's persisted shadow flag so a
+        # live close is never mislabelled as shadow.
+        shadow = bool(self.sm.state.get("shadow", True))
+        tag = "SHADOW" if shadow else "LIVE"
+        self._log(f"[{tag} CLOSE] {reason} | price_pnl={fmt(price_pnl,4)} "
                   f"funding_pnl={fmt(funding_pnl,4)} total={fmt(price_pnl + funding_pnl,4)}")
-        return f"shadow_close:{reason}"
+        return f"{'shadow' if shadow else 'live'}_close:{reason}"
 
-    def _recover_exit(self) -> None:
-        """P0-3: resume an interrupted exit. State is already EXITING on boot, so
-        run the close directly without begin_exit. Phase 1 = re-run shadow close."""
-        self._log("[RECOVERY] EXITING found on boot -> re-run shadow exit")
+    def _recover(self, mode: str) -> None:
+        """review4 P0-C: crash-restart recovery, routed by the PERSISTED shadow
+        flag. A shadow round has no exchange footprint so it rolls back on model
+        state alone. A LIVE round must never guess — it reconciles real positions
+        FIRST and HALTs on any residual, because a naked leg left by a botched
+        entry/exit would otherwise stay invisible until it moved against us."""
+        shadow = bool(self.sm.state.get("shadow", True))
+        if shadow:
+            if mode == ENTERING:
+                self._log("[RECOVERY] shadow ENTERING on boot -> abort to IDLE")
+                self.sm.abort_entry("recovered_entering")
+            else:  # EXITING
+                self._log("[RECOVERY] shadow EXITING on boot -> re-run shadow exit")
+                try:
+                    snap = self.fetch_snapshot()
+                except Exception:
+                    snap = self.last_snapshot or {}
+                self._close_and_finish("recovered_exit", snap)
+            return
+
+        # LIVE recovery — read the truth before touching state.
+        if self._var_gateway is None:
+            reason = f"recovery_no_gateway:{mode}"
+            if self.sm.set_halt(reason):
+                self._log(f"[RECOVERY HALT] live {mode} but no gateway to reconcile")
+                self._alert(f"🛑 HALT: live {mode} recovery has no gateway to verify "
+                            f"positions. Verify both venues manually, then `clear-halt`.")
+            return
         try:
-            snap = self.fetch_snapshot()
+            live = reconcile.reconcile_positions(
+                self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+        except Exception as exc:
+            reason = f"recovery_reconcile_failed:{mode}"
+            if self.sm.set_halt(reason):
+                self._log(f"[RECOVERY HALT] cannot reconcile on {mode} boot: {exc}")
+                self._alert(f"🛑 HALT: live {mode} recovery could not read positions: {exc}. "
+                            f"Verify both venues manually, then `clear-halt`.")
+            return
+        tol = self._size_step() / 2
+        residual = {k: str(v) for k, v in live.items() if abs(D(v)) > tol}
+        if not residual:
+            # No footprint on either venue -> safe to roll the round back.
+            if mode == ENTERING:
+                self._log("[RECOVERY] live ENTERING flat on boot -> abort to IDLE")
+                self.sm.abort_entry("recovered_entering_flat")
+            else:
+                self._log("[RECOVERY] live EXITING flat on boot -> already closed, finalize")
+                self.sm.finish_exit(0.0, self.sm.funding_accrued(), "recovered_exit_flat",
+                                    int(self.cfg.get("close_cooldown_seconds", 1200)))
+            return
+        # Any residual position after a crash is a possible naked leg. Refuse to
+        # trade; latch HALT and let a human flatten and reconcile the book.
+        reason = f"recovery_residual_position:{mode}"
+        if self.sm.set_halt(reason):
+            self._log(f"[RECOVERY HALT] residual positions on {mode} boot: {residual}")
+            self._alert(f"🛑 HALT: live {mode} recovery found residual positions {residual}. "
+                        f"Flatten manually, then `clear-halt`.")
+
+    def _idle_flat_check(self) -> str | None:
+        """review4 P0-C: while live, periodically prove the book is flat between
+        rounds. The single-leg watchdog only runs while HOLDING, so a residual
+        leg from a botched abort would never be seen from IDLE. Every N ticks we
+        reconcile; any residual -> HALT. Returns a halt action string or None.
+
+        Shadow-only deploys have no footprint, so this is a no-op there."""
+        if not (self.live_trading and self._var_gateway is not None):
+            return None
+        every = int(self.cfg.get("idle_reconcile_every_ticks", 20))
+        if every <= 0:
+            return None
+        self._idle_tick_count = int(getattr(self, "_idle_tick_count", 0)) + 1
+        if self._idle_tick_count % every != 0:
+            return None
+        try:
+            live = reconcile.reconcile_positions(
+                self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+        except Exception as exc:
+            # Transient read failure: log and retry next window rather than HALT.
+            self._log(f"[IDLE FLAT-CHECK] reconcile failed (retry next window): {exc}")
+            return None
+        tol = self._size_step() / 2
+        residual = {k: str(v) for k, v in live.items() if abs(D(v)) > tol}
+        if residual:
+            reason = f"idle_residual_position:{residual}"
+            if self.sm.set_halt(reason):
+                self._log(f"[IDLE HALT] book not flat while IDLE: {residual}")
+                self._alert(f"🛑 HALT: residual positions found while IDLE {residual}. "
+                            f"Flatten manually, then `clear-halt`.")
+            return "idle_flat_check_halt"
+        return None
+
+    def _attested_lighter_interval(self) -> int | None:
+        """review4 P0-D: read the persisted funding-settlement attestation and,
+        if it is for Lighter and unexpired, hand its observed interval to the
+        funding-unit gate. Returns None when there is no valid attestation, so
+        the gate stays fail-closed exactly as before."""
+        att = funding_attest.valid_attestation(self.sm.funding_attestation(), "lighter")
+        return int(att["interval_s"]) if att else None
+
+    def _size_step(self) -> Decimal:
+        """Lighter base size step from size_decimals; fail-closed tiny fallback."""
+        try:
+            c = self.lighter.public_contract(self.lighter_symbol)
+            sd = c.get("size_decimals")
+            if sd is not None:
+                return D(1).scaleb(-int(sd))
         except Exception:
-            snap = self.last_snapshot or {}
-        self._close_and_finish("recovered_exit", snap)
+            pass
+        return D("0.0000001")
+
+    def verify_funding(self, *, limit: int = 200) -> dict[str, Any]:
+        """review4 P0-D: pull REAL Lighter funding settlements, prove the cadence
+        is ≈ the configured interval, and persist a time-boxed attestation the
+        funding-unit gate accepts in lieu of a published interval. Read-only:
+        never disarms or trades. Returns a human-readable result dict."""
+        expected = int(self.cfg.get("expected_lighter_funding_interval_s", 3600))
+        try:
+            rows = self.lighter.funding_history(self.lighter_symbol, limit=limit)
+        except Exception as exc:
+            return {"ok": False, "reason": f"funding history fetch failed: {exc}"}
+        val = funding_attest.validate_settlements(
+            rows, expected_interval_s=expected,
+            cadence_tolerance_pct=float(self.cfg.get("funding_cadence_tolerance_pct", 0.2)),
+            min_samples=int(self.cfg.get("funding_min_samples", 3)))
+        # magnitude note (advisory only)
+        rate = None
+        try:
+            rate = self.lighter.funding_rate(self.lighter_symbol).get("rate")
+        except Exception:
+            pass
+        note = funding_attest.amount_plausibility(
+            rows, rate=rate, notional=self.notional, interval_s=expected)
+        if not val["ok"]:
+            self.sm.set_funding_attestation(None)
+            return {"ok": False, "reason": val["reason"], "samples": val["samples"],
+                    "amount_note": note}
+        att = funding_attest.build_attestation(
+            "lighter", int(val["observed_interval_s"]), samples=int(val["samples"]),
+            detail=val["reason"],
+            validity_s=int(self.cfg.get("funding_attestation_validity_s",
+                                        funding_attest.DEFAULT_VALIDITY_S)))
+        self.sm.set_funding_attestation(att)
+        self._log(f"[VERIFY-FUNDING] attested lighter interval={att['interval_s']}s "
+                  f"samples={att['samples']} expires_at={att['expires_at']}")
+        return {"ok": True, "attestation": att, "amount_note": note}
 
     # ---- helpers -----------------------------------------------------------
     def _safe_book(self) -> dict[str, Any] | None:
@@ -445,7 +609,8 @@ class Engine:
             try:
                 live = reconcile.reconcile_positions(
                     self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
-                flat = all(abs(D(v)) <= D("0.0000001") for v in live.values())
+                # P1-3: "flat" is within half a size step, not an arbitrary 1e-7.
+                flat = all(abs(D(v)) <= self._size_step() / 2 for v in live.values())
                 add("book_flat", flat, f"positions={ {k: str(v) for k, v in live.items()} }")
             except Exception as exc:
                 add("book_flat", False, f"reconcile failed: {exc}")
@@ -462,20 +627,35 @@ class Engine:
 
         Only meaningful for a LIVE round (state.shadow == False): a shadow round
         has no exchange footprint, so we return None and the watchdog treats it
-        as balanced. For a live round we reconcile both venues; if EITHER read
-        fails we return a sentinel imbalance so the watchdog flags it rather than
-        silently assuming balanced (fail closed — an unknown leg is dangerous)."""
+        as balanced.
+
+        P1-1: a SINGLE reconcile failure is often a transient venue blip; forcing
+        a protective exit on it would flap us in and out. So we alert once, keep
+        holding, and only escalate to a sentinel imbalance (which forces the
+        watchdog to exit) after ``reconcile_fail_streak`` CONSECUTIVE failures —
+        by then the outage is real and an unknown leg is the greater danger."""
         if bool(self.sm.state.get("shadow", True)) or self._var_gateway is None:
+            self._reconcile_fail_streak = 0
             return None
         try:
-            return reconcile.reconcile_positions(
+            live = reconcile.reconcile_positions(
                 self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+            self._reconcile_fail_streak = 0
+            return live
         except reconcile.ReconcileError as exc:
-            self._log(f"[RECONCILE] failed -> watchdog will flag imbalance: {exc}")
-            self._alert(f"⚠️ Position reconcile failed: {exc}")
-            # Sentinel imbalance: report both flat so check_single_leg sees the
-            # expected legs unmatched and forces a protective exit.
-            return {"variational": ZERO, "lighter": ZERO}
+            self._reconcile_fail_streak = int(getattr(self, "_reconcile_fail_streak", 0)) + 1
+            streak = self._reconcile_fail_streak
+            threshold = int(self.cfg.get("reconcile_fail_streak", 3))
+            self._log(f"[RECONCILE] failure {streak}/{threshold}: {exc}")
+            if streak == 1:
+                self._alert(f"⚠️ Position reconcile failed (will retry): {exc}")
+            if streak >= threshold:
+                self._alert(f"🛑 Position reconcile failed x{streak} -> forcing protective exit")
+                # Sentinel imbalance: report both flat so check_single_leg sees
+                # the expected legs unmatched and forces an exit.
+                return {"variational": ZERO, "lighter": ZERO}
+            # Transient: keep holding (treat as balanced) until the streak trips.
+            return None
 
     def _note_data_failure(self, detail: str) -> None:
         self._data_fail_streak += 1
