@@ -27,6 +27,41 @@ def test_net_hourly_none_when_rate_unknown():
     assert ec.net_hourly_funding_usdt("x", Decimal("12000"), None, Decimal("0.0001")) is None
 
 
+def test_held_funding_positive_while_edge_holds():
+    # short_var_long_lighter earns (var - lit); var richer -> positive
+    held = ec.held_hourly_funding_usdt(
+        "short_var_long_lighter", Decimal("12000"),
+        Decimal("0.000142"), Decimal("0.000013"),
+    )
+    assert held == (Decimal("0.000142") - Decimal("0.000013")) * Decimal("12000")
+    assert held > 0
+
+
+def test_held_funding_negative_after_reversal():
+    # still holding short_var_long_lighter but spread flipped (lit now richer):
+    # we are now PAYING funding -> negative accrual (P0-5)
+    held = ec.held_hourly_funding_usdt(
+        "short_var_long_lighter", Decimal("12000"),
+        Decimal("0.00001"), Decimal("0.00009"),
+    )
+    assert held < 0
+    assert held == (Decimal("0.00001") - Decimal("0.00009")) * Decimal("12000")
+
+
+def test_held_funding_signed_by_direction():
+    # same rates, opposite held direction -> opposite sign
+    v, l = Decimal("0.0001"), Decimal("0.00003")
+    a = ec.held_hourly_funding_usdt("short_var_long_lighter", Decimal("12000"), v, l)
+    b = ec.held_hourly_funding_usdt("short_lighter_long_var", Decimal("12000"), v, l)
+    assert a == -b
+    assert a > 0 and b < 0
+
+
+def test_held_funding_none_when_rate_unknown():
+    assert ec.held_hourly_funding_usdt("short_var_long_lighter", Decimal("12000"),
+                                       None, Decimal("0.0001")) is None
+
+
 def test_break_even_hours_formula():
     # cost 18, basis gain 11 -> net 7; net_hourly 1.5/h -> 7/1.5
     be = ec.break_even_hours(Decimal("18"), Decimal("11"), Decimal("1.5"))

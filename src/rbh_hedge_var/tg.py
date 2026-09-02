@@ -43,6 +43,9 @@ class TelegramNotifier:
         if not self.enabled:
             return False
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        # Contract-as-code: this notifier may ONLY ever reach Telegram. If a future
+        # edit points it elsewhere, fail loudly rather than exfiltrate anywhere.
+        assert url.startswith("https://api.telegram.org/"), "tg notifier restricted to Telegram"
         payload = urllib.parse.urlencode({
             "chat_id": self.chat_id,
             "text": text[:4000],

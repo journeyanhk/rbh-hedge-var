@@ -167,15 +167,25 @@ class Engine:
         legs = self.sm.state.get("legs") or []
         book = self._safe_book()
 
-        # P0-1: accrue estimated funding for the elapsed wall-clock time.
-        net_hr = snap.get("net_funding_hourly_usdt")
+        # P0-1/P0-5: accrue funding for the elapsed wall-clock time, SIGNED by the
+        # held direction so a reversal correctly accrues a NEGATIVE increment
+        # (we pay funding) instead of the unsigned entry-candidate edge.
+        held_hr = economics.held_hourly_funding_usdt(
+            direction, self.notional,
+            snap.get("var_funding_hourly"), snap.get("lighter_funding_hourly"),
+        )
         now = int(time.time())
         last = self.sm.state.get("funding_last_accrual_ts") or self.sm.state.get("opened_at") or now
         elapsed = max(0, now - int(last))
-        if net_hr is not None and elapsed > 0:
-            inc = D(net_hr) * (D(elapsed) / SECONDS_PER_HOUR)
+        if held_hr is not None and elapsed > 0:
+            inc = D(held_hr) * (D(elapsed) / SECONDS_PER_HOUR)
             self.sm.accrue_funding(float(inc))
+        elif held_hr is None and elapsed > 0:
+            # Funding unknown (missing rate): we conservatively accrue nothing but
+            # still advance the clock. Log it so a long data gap is visible.
+            self._log(f"[FUNDING] rate unavailable for {elapsed}s -> accrued 0 (ledger may understate)")
         self.sm.state["funding_last_accrual_ts"] = now
+        snap["held_funding_hourly_usdt"] = held_hr
         funding_pnl = D(self.sm.funding_accrued())
 
         # P0-2: mark-to-market the price legs, combine with funding.
@@ -251,12 +261,22 @@ class Engine:
     def _close_and_finish(self, reason: str, snap: dict[str, Any]) -> str:
         """Close both legs and book the round. Assumes state is already EXITING
         (either via begin_exit or a recovered restart), so it never re-transitions
-        into EXITING — that would be an illegal self-transition (P0-3 fix)."""
+        into EXITING — that would be an illegal self-transition (P0-3 fix).
+
+        P1-9: refuse to settle on a zero/absent price. On a crash-restart the
+        recovery snapshot can be empty, which would mark the long leg at
+        (0 - entry) * qty — a huge fake loss written to the ledger that could
+        even trip the drawdown HALT. Fail closed: stay in EXITING, log, and let
+        the next tick retry once real prices are back."""
+        var_price = snap.get("var_price") or ZERO
+        lit_price = snap.get("lighter_price") or ZERO
+        if var_price <= ZERO or lit_price <= ZERO:
+            self._log(f"[RECOVERY DEFERRED] exit '{reason}' held: "
+                      f"var_price={var_price} lit_price={lit_price} — retry next tick")
+            return f"exit_deferred:{reason}"
         legs = self.sm.state.get("legs") or []
         book = self._safe_book()
-        result = self.executor.close_hedge(
-            legs, snap.get("var_price") or ZERO, snap.get("lighter_price") or ZERO, book,
-        )
+        result = self.executor.close_hedge(legs, var_price, lit_price, book)
         price_pnl = float(result.get("price_pnl") or 0)
         funding_pnl = self.sm.funding_accrued()   # P0-1: booked separately
         self.sm.finish_exit(price_pnl, funding_pnl, reason,

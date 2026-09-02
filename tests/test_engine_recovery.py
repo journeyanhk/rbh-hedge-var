@@ -32,6 +32,8 @@ def _snap(**kw):
     base = {
         "var_price": Decimal("4330"), "lighter_price": Decimal("4320"),
         "spread_hourly": Decimal("0.0001"), "basis": Decimal("0.002"),
+        # per-leg hourly funding (var - lit = 0.0001 -> 1.2/h edge @ 12k)
+        "var_funding_hourly": Decimal("0.0001"), "lighter_funding_hourly": Decimal("0"),
         "net_funding_hourly_usdt": Decimal("1.2"), "data_errors": {},
     }
     base.update(kw)
@@ -50,6 +52,45 @@ def test_funding_accrues_while_holding(tmp_path):
     assert action == "holding"
     assert Decimal("2.3") < Decimal(str(eng.sm.funding_accrued())) < Decimal("2.5")
     assert eng.sm.mode == SM.HOLDING
+
+
+def test_funding_accrues_negative_after_reversal(tmp_path):
+    # P0-5: still holding short_var_long_lighter but the spread has flipped
+    # (lighter now richer). The held position is PAYING funding, so the accrual
+    # increment must be negative, not the unsigned entry edge.
+    eng = _engine(tmp_path, max_round_loss_usdt=0.0, take_profit_total_pnl_usdt=0.0,
+                  taker_slippage_pct=0.0, force_exit_basis_pct=0.9,
+                  exit_on_spread_reversal=False)
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(LEGS)
+    eng.sm.state["opened_at"] = int(time.time()) - 3600
+    eng.sm.state["funding_last_accrual_ts"] = int(time.time()) - 3600
+    eng.sm.save()
+    # var 0.00001, lit 0.00009 -> held = (0.00001-0.00009)*12000 = -0.96/h
+    snap = _snap(spread_hourly=Decimal("-0.00008"),
+                 var_funding_hourly=Decimal("0.00001"),
+                 lighter_funding_hourly=Decimal("0.00009"))
+    eng._hold_tick(snap)
+    assert eng.sm.funding_accrued() < 0, "reversal must accrue negative funding"
+    assert Decimal("-1.0") < Decimal(str(eng.sm.funding_accrued())) < Decimal("-0.9")
+
+
+def test_recover_exit_deferred_on_zero_price(tmp_path):
+    # P1-9: a crash-restart with an empty recovery snapshot must NOT settle at
+    # price 0 (which would book a huge fake loss). Stay EXITING and retry.
+    eng = _engine(tmp_path)
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(LEGS)
+    eng.sm.begin_exit("mid")
+    action = eng._close_and_finish("recovered_exit", {})  # no prices
+    assert action == "exit_deferred:recovered_exit"
+    assert eng.sm.mode == SM.EXITING
+    assert eng.sm.today_pnl() == 0.0  # nothing booked, no fake loss
+    # next tick with real prices completes the exit
+    action2 = eng._close_and_finish("recovered_exit",
+                                    {"var_price": Decimal("4330"), "lighter_price": Decimal("4320")})
+    assert action2.startswith("shadow_close")
+    assert eng.sm.mode == SM.COOLDOWN
 
 
 def test_per_round_stop_loss_closes(tmp_path):

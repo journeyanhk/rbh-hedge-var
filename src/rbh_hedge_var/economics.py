@@ -56,17 +56,39 @@ def roundtrip_cost_usdt(notional: Decimal, cfg: dict[str, Any]) -> Decimal:
 
 def net_hourly_funding_usdt(direction: str, notional: Decimal,
                             var_hourly: Decimal | None, lit_hourly: Decimal | None) -> Decimal | None:
-    """Net funding cashflow per hour for the hedge (positive = we earn).
+    """Best-case funding edge per hour for a NEW entry (positive = we earn).
 
-    Short leg receives funding when its rate is positive; long leg pays it.
-    We short the higher-funding leg, so net = |spread| * notional.
+    At entry we always short the higher-funding leg, so the achievable edge is
+    |spread| * notional. This is the ENTRY-CANDIDATE projection only — it must
+    NOT be used to accrue funding on an open position, because once the spread
+    reverses the held position is paying, not earning. Use
+    ``held_hourly_funding_usdt`` for accrual on an existing leg.
     """
     if var_hourly is None or lit_hourly is None:
         return None
     spread = var_hourly - lit_hourly
-    # Whichever direction we take, the realized edge is |spread| * notional/hr
-    # because we always short the higher and long the lower.
     return abs(spread) * D(notional)
+
+
+def held_hourly_funding_usdt(direction: str, notional: Decimal,
+                             var_hourly: Decimal | None,
+                             lit_hourly: Decimal | None) -> Decimal | None:
+    """Funding cashflow per hour for a position ALREADY HELD in `direction`.
+
+    Signed relative to the leg we are actually short: positive while the entry
+    edge holds, NEGATIVE once the funding spread reverses (we then pay funding).
+    This is what P0-5 requires — accruing the unsigned |spread| systematically
+    overstated the shadow ledger through every reversal/oscillation window.
+
+      short_var_long_lighter  -> we are short Var: earn (var - lit)
+      short_lighter_long_var  -> we are short Lighter: earn (lit - var)
+    """
+    if var_hourly is None or lit_hourly is None:
+        return None
+    signed = var_hourly - lit_hourly          # >0 = Variational funding higher
+    if direction == "short_lighter_long_var":
+        signed = -signed
+    return signed * D(notional)               # may be negative during a reversal
 
 
 def break_even_hours(roundtrip_cost: Decimal, entry_basis_gain: Decimal,
