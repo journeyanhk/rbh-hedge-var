@@ -69,6 +69,10 @@ class LighterSignerClient:
         # signer_factory is a test seam: inject a fake SignerClient without the SDK.
         self._signer_factory = signer_factory
         self._signer_obj: Any | None = None
+        # lighter-python's ApiClient wraps an async httpx client that binds to an
+        # event loop at construction; every signer coroutine must then run on
+        # THAT SAME loop. We own one dedicated loop for the signer's whole life.
+        self._loop: Any | None = None
 
     # ---- lazy SDK ----------------------------------------------------------
     def _signer(self) -> Any:
@@ -103,8 +107,30 @@ class LighterSignerClient:
                 f"({list(params)}) — cannot pass the API private key")
         if "chain_id" in params:
             kwargs["chain_id"] = self.chain_id
-        self._signer_obj = SignerClient(**kwargs)
+        # Construct INSIDE our loop so the async ApiClient/nonce-manager see a
+        # running loop (else Py3.11 raises "no running event loop" at init).
+        async def _construct() -> Any:
+            return SignerClient(**kwargs)
+        self._signer_obj = self._loop_run(_construct())
         return self._signer_obj
+
+    # ---- dedicated event loop ---------------------------------------------
+    def _loop_run(self, coro: Any) -> Any:
+        """Run one signer coroutine on our dedicated loop and return its result.
+
+        Non-awaitables (sync SDK methods or test fakes returning tuples) pass
+        through unchanged. All awaitables run on the SAME persistent loop the
+        signer was constructed on, so the bound async httpx client stays valid.
+        """
+        import asyncio
+        import inspect
+        if not inspect.isawaitable(coro):
+            return coro
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+        if self._loop.is_running():  # pragma: no cover - defensive
+            raise LighterSignerError("signer loop already running — reentrant call")
+        return self._loop.run_until_complete(coro)
 
     # ---- sizing (fail-closed) ---------------------------------------------
     def _market_meta(self, symbol: str) -> dict[str, Any]:
@@ -149,7 +175,7 @@ class LighterSignerClient:
         signer = self._signer()
         coi = _client_order_index()
         # SDK surface (lighter-python): create_market_order returns (tx, tx_hash, err).
-        tx, tx_hash, err = _run(signer.create_market_order(
+        tx, tx_hash, err = self._loop_run(signer.create_market_order(
             market_index=amt["market_index"],
             client_order_index=coi,
             base_amount=amt["base_amount"],
@@ -169,7 +195,7 @@ class LighterSignerClient:
         if net_guard.is_armed():
             raise net_guard.WriteBlockedError("write-guard armed: refusing Lighter cancel_all")
         signer = self._signer()
-        tx, tx_hash, err = _run(signer.cancel_all_orders())
+        tx, tx_hash, err = self._loop_run(signer.cancel_all_orders())
         if err is not None:
             raise LighterSignerError(f"Lighter cancel_all failed: {err}")
         return {"venue": "lighter", "cancelled": True, "tx_hash": tx_hash}
@@ -220,24 +246,3 @@ class LighterSignerClient:
             raise LighterSignerError(f"Lighter auth-token creation failed: {err}")
         return auth
 
-
-def _run(coro: Any) -> Any:
-    """Run one SDK coroutine to completion.
-
-    lighter-python is async. We keep the engine synchronous (one tick, one
-    blocking call) rather than threading an event loop through the whole app.
-    If the SDK method is synchronous (or a test fake returns a tuple directly),
-    pass it through unchanged.
-    """
-    import asyncio
-    import inspect
-    if inspect.isawaitable(coro):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():  # pragma: no cover - defensive
-                raise LighterSignerError("cannot run signer coroutine inside a running loop")
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
-    return coro

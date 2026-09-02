@@ -612,15 +612,27 @@ class Engine:
         add("live_stack_built", self._live_executor is not None,
             "gateways constructed" if self._live_executor is not None else "gateways missing/failed")
 
-        # Credentials present (do not print secrets).
+        # Credentials present (do not print secrets). Match the configured
+        # Variational auth scheme: "token" (default) reads VARIATIONAL_TOKEN;
+        # "hmac" reads VARIATIONAL_API_KEY/SECRET. Checking the wrong pair gives
+        # a false "missing" when the operator configured the other scheme.
         lcfg = self.cfg.get("lighter", {})
         vcfg = self.cfg.get("variational", {})
+        v_env = vcfg.get("token_env_file", ".env")
         lit_pk = read_env(lcfg.get("account_env_file", ".env"), ("LIGHTER_API_KEY_PRIVATE_KEY",))
-        var_key = read_env(vcfg.get("token_env_file", ".env"), ("VARIATIONAL_API_KEY",))
-        var_sec = read_env(vcfg.get("token_env_file", ".env"), ("VARIATIONAL_API_SECRET",))
         add("lighter_signer_key", bool(lit_pk), "LIGHTER_API_KEY_PRIVATE_KEY present" if lit_pk else "missing")
-        add("variational_api_creds", bool(var_key and var_sec),
-            "VARIATIONAL_API_KEY/SECRET present" if (var_key and var_sec) else "missing")
+
+        v_scheme = str(vcfg.get("auth_scheme", "token")).lower()
+        if v_scheme == "token":
+            v_tok = read_env(v_env, ("VARIATIONAL_TOKEN", "VARIATIONAL_API_TOKEN"))
+            add("variational_api_creds", bool(v_tok),
+                "VARIATIONAL_TOKEN present (token scheme)" if v_tok else "VARIATIONAL_TOKEN missing (token scheme)")
+        else:
+            v_key = read_env(v_env, ("VARIATIONAL_API_KEY",))
+            v_sec = read_env(v_env, ("VARIATIONAL_API_SECRET",))
+            add("variational_api_creds", bool(v_key and v_sec),
+                "VARIATIONAL_API_KEY/SECRET present (hmac scheme)" if (v_key and v_sec)
+                else "VARIATIONAL_API_KEY/SECRET missing (hmac scheme)")
 
         # Lighter SDK importable.
         try:
