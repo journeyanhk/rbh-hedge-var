@@ -107,7 +107,9 @@ class ShadowExecutor:
             open_side = leg["side"]
             close_side = "buy" if open_side == "sell" else "sell"
             if venue == "lighter":
-                levels = lit_book.get("bids") if close_side == "sell" else lit_book.get("asks") if lit_book else None
+                levels = None
+                if lit_book:
+                    levels = lit_book.get("bids") if close_side == "sell" else lit_book.get("asks")
                 exit_price = self._model_price(close_side, lit_price, levels, qty)
             else:
                 exit_price = self._model_price(close_side, var_price, None, qty)
