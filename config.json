@@ -1,0 +1,58 @@
+{
+  "//": "rbh-hedge-var Phase 1 config. Live execution is gated OFF by design.",
+
+  "enabled": false,
+  "phase": 1,
+  "live_trading": false,
+
+  "symbol": "XAU",
+  "variational": {
+    "symbol": "XAU",
+    "base_url": "https://omni.variational.io",
+    "token_env_file": ".env"
+  },
+  "lighter": {
+    "symbol": "XAU",
+    "base_url": "https://api.rh.lighter.xyz",
+    "chain_id": 466324,
+    "account_env_file": ".env"
+  },
+
+  "//direction": "auto = pick side from funding-spread sign each tick (agreed).",
+  "direction_mode": "auto",
+
+  "notional_per_leg_usdt": 12000.0,
+  "leverage": 10,
+
+  "//funding_guard": "Hard gate: both legs must publish a positive funding_interval_s. Verified live: Variational settles 4h (14400s, annualized rate); RHC Lighter is hourly but does NOT publish the interval field, so it stays UNVERIFIED until private settlement confirms it in Phase 2.",
+  "expected_variational_funding_interval_s": 14400,
+  "expected_lighter_funding_interval_s": 3600,
+  "require_funding_unit_verified_for_live": true,
+
+  "//entry": "Signals are computed in hourly-normalized funding units.",
+  "entry_spread_threshold_hourly": 0.00002,
+  "max_entry_price_diff_usdt": 6.0,
+  "max_basis_pct": 0.015,
+
+  "//exit": "Exit is trigger-based, never a timer.",
+  "force_exit_basis_pct": 0.02,
+  "exit_on_spread_reversal": true,
+  "spread_reversal_confirm_ticks": 3,
+  "take_profit_total_pnl_usdt": 0.0,
+  "max_round_loss_usdt": 8.0,
+
+  "//cost": "Round-trip cost model for the break-even projection (measure live before trusting).",
+  "assumed_roundtrip_cost_pct": 0.0015,
+  "taker_slippage_pct": 0.0005,
+
+  "//risk": "Single-leg exposure watchdog + drawdown circuit breaker.",
+  "single_leg_watchdog_enabled": true,
+  "max_daily_loss_usdt": 15.0,
+  "close_cooldown_seconds": 1200,
+
+  "poll_interval_seconds": 60,
+  "state_file": "state.json",
+  "log_file": "logs/rbh_hedge_var.log",
+  "monitor_port": 8012,
+  "monitor_bind": "127.0.0.1"
+}

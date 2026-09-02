@@ -1,0 +1,13 @@
+# Phase 1 (shadow / read-only) runtime dependencies.
+# Standard library covers Lighter public REST + the monitor server.
+# curl_cffi is used to fetch Variational public metadata behind Cloudflare;
+# the Variational client degrades gracefully (marks data UNVERIFIED) if it is
+# missing, so the shadow engine still runs on a bare stdlib install.
+curl_cffi>=0.7.0
+
+# Phase 2 (live execution) — installed only when going live. Kept here for
+# reference; not imported anywhere in the Phase 1 code paths.
+# lighter-python>=0.1.0
+
+# Dev / CI
+pytest>=8.0
