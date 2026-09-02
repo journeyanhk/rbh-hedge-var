@@ -25,7 +25,24 @@ def _engine(tmp_path, **over):
     cfg["state_file"] = str(tmp_path / "state.json")
     cfg["log_file"] = str(tmp_path / "log.log")
     cfg.update(over)
-    return Engine(cfg)
+    eng = Engine(cfg)
+    # Hermetic: these tests assert on fixed leg prices, so the MTM close must use
+    # the reference price, NOT the LIVE Lighter order book. Without this stub
+    # `_hold_tick`/`_close_and_finish` fetch the real book over the network and a
+    # market move (live XAU != the hard-coded leg price) flips the sign of the
+    # entry baseline and makes the suite flaky.
+    eng._safe_book = lambda: None
+    # Hermetic: the lighter contract (size step, decimals) is a live REST call.
+    # Unit tests assert on fixed legs, so pin a deterministic offline contract.
+    eng.lighter.public_contract = lambda symbol: {
+        "venue": "lighter", "symbol": str(symbol).upper(), "market_id": 0,
+        "mark_price": Decimal("4320"), "index_price": Decimal("4320"),
+        "last_price": Decimal("4320"), "size_decimals": 4, "price_decimals": 2,
+        "min_base_amount": Decimal("0"), "min_quote_amount": Decimal("0"),
+        "maker_fee": Decimal("0"), "taker_fee": Decimal("0"),
+        "multiplier": Decimal("1"), "status": "active", "reduce_only": False,
+    }
+    return eng
 
 
 def _snap(**kw):
@@ -42,7 +59,7 @@ def _snap(**kw):
 
 def test_funding_accrues_while_holding(tmp_path):
     eng = _engine(tmp_path, max_round_loss_usdt=0.0, take_profit_total_pnl_usdt=0.0,
-                  taker_slippage_pct=0.0)
+                  taker_slippage_pct=0.0, notional_per_leg_usdt=12000.0)
     eng.sm.begin_entry("short_var_long_lighter", "t")
     eng.sm.confirm_hold(LEGS)
     eng.sm.state["opened_at"] = int(time.time()) - 7200
@@ -60,7 +77,7 @@ def test_funding_accrues_negative_after_reversal(tmp_path):
     # increment must be negative, not the unsigned entry edge.
     eng = _engine(tmp_path, max_round_loss_usdt=0.0, take_profit_total_pnl_usdt=0.0,
                   taker_slippage_pct=0.0, force_exit_basis_pct=0.9,
-                  exit_on_spread_reversal=False)
+                  exit_on_spread_reversal=False, notional_per_leg_usdt=12000.0)
     eng.sm.begin_entry("short_var_long_lighter", "t")
     eng.sm.confirm_hold(LEGS)
     eng.sm.state["opened_at"] = int(time.time()) - 3600

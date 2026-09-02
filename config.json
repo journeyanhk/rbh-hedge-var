@@ -10,14 +10,22 @@
     "symbol": "XAU",
     "base_url": "https://omni.variational.io",
     "token_env_file": ".env",
-    "funding_unit": "annualized"
+    "funding_unit": "annualized",
+    "//phase2_auth": "Order gateway reads VARIATIONAL_API_KEY / VARIATIONAL_API_SECRET from token_env_file. paths + impersonate are REVIEW-REQUIRED: pin to Variational's real private RFQ API before go-live.",
+    "impersonate": true,
+    "paths": {
+      "request_quote": "/api/rfq/quote",
+      "accept_quote": "/api/rfq/accept",
+      "positions": "/api/account/positions"
+    }
   },
   "lighter": {
     "symbol": "XAU",
     "base_url": "https://api.rh.lighter.xyz",
     "chain_id": 466324,
     "account_env_file": ".env",
-    "funding_unit": "per_interval"
+    "funding_unit": "per_interval",
+    "//phase2_signer": "SignerClient reads LIGHTER_API_KEY_PRIVATE_KEY / LIGHTER_API_KEY_INDEX / LIGHTER_ACCOUNT_INDEX from account_env_file. Requires `pip install lighter-python` on the live host."
   },
 
   "//funding_unit": "Explicit per-venue funding unit (P1-2). Variational publishes an ANNUALIZED rate; RHC Lighter a per-interval decimal. The magnitude heuristic is now only a mismatch warning, not the source of truth.",
@@ -48,6 +56,20 @@
   "//cost": "Round-trip cost model for the break-even projection (measure live before trusting).",
   "assumed_roundtrip_cost_pct": 0.0015,
   "taker_slippage_pct": 0.0005,
+
+  "//live_fill_confirm": "review4 P0-A: a leg is proven FILLED only by polling the venue signed position vs a pre-trade baseline. Timeout/poll for that confirmation loop.",
+  "fill_confirm_timeout_s": 30,
+  "fill_confirm_poll_s": 2,
+
+  "//live_reconcile": "review4 P0-C/P1-1: IDLE flat-check cadence (every N ticks while live) and how many CONSECUTIVE reconcile failures before a HOLDING round forces a protective exit.",
+  "idle_reconcile_every_ticks": 20,
+  "reconcile_fail_streak": 3,
+
+  "//funding_attestation": "review4 P0-D: verify-funding proves Lighter's hourly cadence from real settlements and writes a time-boxed attestation. Validity default 7d; cadence tolerance 20%; needs >= min_samples settlements.",
+  "funding_history_limit": 200,
+  "funding_min_samples": 3,
+  "funding_cadence_tolerance_pct": 0.2,
+  "funding_attestation_validity_s": 604800,
 
   "//risk": "Single-leg exposure watchdog + drawdown circuit breaker. max_round_loss_usdt is measured RELATIVE to the open baseline (sunk roundtrip cost excluded). max_daily_loss floor sits above the ~$24 roundtrip cost so a normal round cannot trip it (review3).",
   "single_leg_watchdog_enabled": true,

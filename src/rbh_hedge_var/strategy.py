@@ -33,10 +33,13 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
     lit_int = lighter_funding.get("funding_interval_s")      # published, may be None
 
     # Live gate uses ONLY published intervals -> fails closed when unknown.
+    # review4 P0-D: a valid private funding attestation may stand in for the
+    # interval Lighter never publishes (engine injects it as a private cfg key).
     unit = funding_guard.verify_units(
         var_int, lit_int,
         expected_var_s=int(cfg.get("expected_variational_funding_interval_s", 3600)),
         expected_lighter_s=int(cfg.get("expected_lighter_funding_interval_s", 3600)),
+        lighter_attested_interval_s=cfg.get("_attested_lighter_interval_s"),
     )
 
     # Economics/display use a REFERENCE interval so the dashboard still shows
