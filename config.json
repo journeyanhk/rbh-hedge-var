@@ -49,9 +49,9 @@
   "assumed_roundtrip_cost_pct": 0.0015,
   "taker_slippage_pct": 0.0005,
 
-  "//risk": "Single-leg exposure watchdog + drawdown circuit breaker.",
+  "//risk": "Single-leg exposure watchdog + drawdown circuit breaker. max_round_loss_usdt is measured RELATIVE to the open baseline (sunk roundtrip cost excluded). max_daily_loss floor sits above the ~$24 roundtrip cost so a normal round cannot trip it (review3).",
   "single_leg_watchdog_enabled": true,
-  "max_daily_loss_usdt": 15.0,
+  "max_daily_loss_usdt": 50.0,
   "close_cooldown_seconds": 1200,
 
   "//alerts": "Telegram alerts for HALT / single-leg / sustained data failure (P0-4). No-op when creds absent. Keys TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in env_file.",

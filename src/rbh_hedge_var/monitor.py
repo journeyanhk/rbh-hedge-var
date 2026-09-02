@@ -34,13 +34,16 @@ async function load(){
  const r=await fetch('state.json'+'?_='+Date.now());const d=await r.json();
  const s=d.snapshot||{},st=d.state||{};
  const v=st.funding_verified?'<span class=ok>VERIFIED</span>':'<span class=bad>'+(s.funding_unit_status||'unknown')+'</span>';
+ const halt=st.halt?('<span class=bad>HALTED: '+(st.halt.reason||'')+'</span>'):'<span class=ok>no</span>';
  let h='<table>';
- const rows=[['mode',st.mode],['round_id',st.round_id],['direction',st.direction||'-'],
+ const rows=[['mode',st.mode],['halt',halt],['round_id',st.round_id],['direction',st.direction||'-'],
   ['candidate_direction',s.candidate_direction||'-'],['funding unit',v],['funding reason',s.funding_unit_reason||''],
   ['var_price',s.var_price],['lighter_price',s.lighter_price],['basis',s.basis],
   ['var_funding_hourly',s.var_funding_hourly],['lighter_funding_hourly',s.lighter_funding_hourly],
   ['spread_hourly',s.spread_hourly],['net_funding_hourly_usdt',s.net_funding_hourly_usdt],
-  ['break_even_hours',s.break_even_hours],['realized_pnl(shadow)',st.realized_pnl],
+  ['break_even_hours',s.break_even_hours],
+  ['entry_mtm(sunk cost)',s.entry_mtm_usdt],['unrealized_total_pnl',s.unrealized_total_pnl_usdt],
+  ['round_pnl_vs_entry',s.round_pnl_vs_entry_usdt],['realized_pnl(shadow)',st.realized_pnl],
   ['reversal_streak',st.reversal_streak],['last_reason',st.last_reason]];
  for(const[k,val]of rows)h+='<tr><td class=k>'+k+'</td><td>'+(val==null?'-':val)+'</td></tr>';
  h+='</table><h3>round history</h3><pre>'+JSON.stringify(st.round_history||[],null,1)+'</pre>';
