@@ -93,10 +93,28 @@ def test_recover_exit_deferred_on_zero_price(tmp_path):
     assert eng.sm.mode == SM.COOLDOWN
 
 
-def test_per_round_stop_loss_closes(tmp_path):
+def test_no_stop_loss_on_fresh_open(tmp_path):
+    # review3 P0: a freshly opened round carries ~2x taker slippage as a sunk
+    # cost baseline; the per-round stop must NOT fire on tick #1 with no market move.
     eng = _engine(tmp_path, max_round_loss_usdt=8.0)
     eng.sm.begin_entry("short_var_long_lighter", "t")
     eng.sm.confirm_hold(LEGS)
+    # entry prices == leg fill prices, no adverse move
+    action = eng._hold_tick(_snap(var_price=Decimal("4330"), lighter_price=Decimal("4320")))
+    assert action == "holding", f"should hold, got {action}"
+    assert eng.sm.mode == SM.HOLDING
+    # baseline captured the sunk cost (negative), adverse ~ 0
+    assert eng.sm.state["entry_mtm_usdt"] < 0
+
+
+def test_per_round_stop_loss_closes_on_adverse_move(tmp_path):
+    eng = _engine(tmp_path, max_round_loss_usdt=8.0)
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(LEGS)
+    # tick 1 at entry prices establishes the baseline, holds
+    assert eng._hold_tick(_snap(var_price=Decimal("4330"), lighter_price=Decimal("4320"))) == "holding"
+    # tick 2: big adverse move (short var up, long lighter down) -> deterioration
+    # relative to baseline exceeds $8 -> stop-loss
     action = eng._hold_tick(_snap(var_price=Decimal("4360"), lighter_price=Decimal("4300")))
     assert action.startswith("shadow_close:round_stop_loss")
     assert eng.sm.mode == SM.COOLDOWN
@@ -127,13 +145,38 @@ def test_recover_from_entering_aborts(tmp_path):
     assert eng2.sm.state["mode"] != SM.ENTERING
 
 
-def test_halt_latch_short_circuits_tick(tmp_path):
+def test_halt_keeps_snapshot_live_but_skips_trading(tmp_path):
+    # review3: under HALT the dashboard must stay live (snapshot fetched) while
+    # all trading is skipped. The old behavior froze the snapshot to a row of "-".
     eng = _engine(tmp_path)
     eng.sm.set_halt("drawdown")
+    calls = {"n": 0}
 
-    def _boom():
-        raise AssertionError("must not fetch data while halted")
+    def _snap_counting():
+        calls["n"] += 1
+        return _snap()
 
-    eng.fetch_snapshot = _boom
+    eng.fetch_snapshot = _snap_counting
     out = eng.tick()
+    assert calls["n"] == 1, "snapshot must be fetched even while halted"
     assert out.get("halt") == "drawdown"
+    assert out.get("action") == "halted"
+    assert out.get("snapshot"), "snapshot must be returned for the dashboard"
+
+
+def test_clear_halt_resets_ledger_and_resumes(tmp_path):
+    eng = _engine(tmp_path)
+    eng.sm.state["daily_pnl"] = {"2026-09-02": -28.5}
+    eng.sm.state["realized_pnl"] = -28.5
+    eng.sm.set_halt("daily loss -28.5 breached limit -50")
+    prior = eng.sm.clear_halt_and_ledger()
+    assert prior["halt"]["reason"].startswith("daily loss")
+    assert eng.sm.is_halted() is False
+    assert eng.sm.state["realized_pnl"] == 0.0
+    assert eng.sm.state["daily_pnl"] == {}
+    # a subsequent tick no longer short-circuits on halt (spread None blocks entry
+    # so the tick stays offline/deterministic)
+    eng.fetch_snapshot = lambda: _snap(spread_hourly=None)
+    out = eng.tick()
+    assert out.get("halt") in (None, "")
+    assert str(out.get("action", "")).startswith("no_entry")

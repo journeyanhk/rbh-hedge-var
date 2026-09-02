@@ -5,6 +5,7 @@ Commands (all read-only / shadow in Phase 1):
   once         run a single engine tick and print the result
   run          run the engine loop + monitor until interrupted
   guard-check  print net-guard status (proves writes are blocked)
+  clear-halt   clear a latched drawdown HALT and reset PnL counters
 
 Usage:
   python -m rbh_hedge_var <command> [--config config.json]
@@ -56,6 +57,23 @@ def cmd_guard_check(cfg) -> int:
     return 0
 
 
+def cmd_clear_halt(cfg) -> int:
+    from .state_machine import StateMachine
+    sm = StateMachine(cfg.get("state_file", "state.json"))
+    if not sm.is_halted():
+        print(json.dumps({"halted": False, "message": "no HALT latched; nothing to clear"}, indent=2))
+        return 0
+    prior = sm.clear_halt_and_ledger()
+    print(json.dumps({
+        "halted": False,
+        "cleared": True,
+        "message": "HALT cleared; realized_pnl and daily_pnl reset "
+                   "(shadow_rounds.jsonl preserved). Restart or next tick resumes.",
+        "prior": prior,
+    }, indent=2, default=str))
+    return 0
+
+
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
     serve(cfg.get("state_file", "state.json"),
@@ -89,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(cfg)
     if command == "guard-check":
         return cmd_guard_check(cfg)
+    if command == "clear-halt":
+        return cmd_clear_halt(cfg)
     print(f"unknown command: {command}\n{__doc__}")
     return 2
 

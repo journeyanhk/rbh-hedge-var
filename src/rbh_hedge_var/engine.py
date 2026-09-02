@@ -101,28 +101,25 @@ class Engine:
 
     # ---- tick --------------------------------------------------------------
     def tick(self) -> dict[str, Any]:
-        # 0) Latched HALT (P1-5): once tripped, refuse all activity until a human
-        #    clears state["halt"]. Persisted, so it survives restart.
-        if self.sm.is_halted():
-            return {"ok": True, "mode": self.sm.mode, "halt": self.sm.halt_reason(),
-                    "snapshot": _display(self.last_snapshot)}
+        # 1) Crash-restart recovery (P0-3): resolve a persisted ENTERING/EXITING
+        #    before trading. Skip while halted (no trading actions when halted).
+        if not self.sm.is_halted():
+            if self.sm.mode == ENTERING:
+                self.sm.abort_entry("recovered_after_restart")
+                self._log("[RECOVERY] ENTERING found on boot -> abort_entry (shadow)")
+            elif self.sm.mode == EXITING:
+                self._recover_exit()
 
-        # 1) Crash-restart recovery (P0-3): the engine only ever loads a
-        #    persisted ENTERING/EXITING if it died mid-transition. Resolve it
-        #    before doing anything else so the machine can never deadlock.
-        if self.sm.mode == ENTERING:
-            self.sm.abort_entry("recovered_after_restart")
-            self._log("[RECOVERY] ENTERING found on boot -> abort_entry (shadow)")
-        elif self.sm.mode == EXITING:
-            self._recover_exit()
-
+        # 2) Always fetch market data FIRST so the dashboard stays live even under
+        #    a HALT (review3: HALT must not freeze the snapshot to a row of "-").
         try:
             snap = self.fetch_snapshot()
             self.last_error = None
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             self._note_data_failure(self.last_error)
-            return {"ok": False, "error": self.last_error, "mode": self.sm.mode}
+            return {"ok": False, "error": self.last_error, "mode": self.sm.mode,
+                    "halt": self.sm.halt_reason()}
         self.last_snapshot = snap
 
         # Track data-source health (P0-4 alert on sustained failure).
@@ -131,12 +128,19 @@ class Engine:
         else:
             self._data_fail_streak = 0
 
-        # 2) Drawdown circuit breaker -> latch HALT (P1-5).
+        # 3) Latched HALT (P1-5): once tripped, refuse all TRADING until a human
+        #    runs `clear-halt`. Snapshot above is fresh, so the dashboard stays
+        #    live; we only skip the trading decision here.
+        if self.sm.is_halted():
+            return {"ok": True, "mode": self.sm.mode, "halt": self.sm.halt_reason(),
+                    "action": "halted", "snapshot": _display(snap)}
+
+        # 4) Drawdown circuit breaker -> latch HALT (P1-5).
         dd = watchdog.check_drawdown(D(self.sm.today_pnl()), D(self.cfg.get("max_daily_loss_usdt", 15)))
         if not dd.ok:
             if self.sm.set_halt(dd.reason):
                 self._log(f"[HALT] {dd.reason}")
-                self._alert(f"🛑 HALT (drawdown): {dd.reason}. Manual clear of state.halt required.")
+                self._alert(f"🛑 HALT (drawdown): {dd.reason}. Run `clear-halt` to resume.")
             return {"ok": True, "mode": self.sm.mode, "halt": dd.reason, "snapshot": _display(snap)}
 
         mode = self.sm.mode
@@ -193,9 +197,22 @@ class Engine:
             legs, snap.get("var_price") or ZERO, snap.get("lighter_price") or ZERO, book,
         )
         total_pnl = price_pnl + funding_pnl
+
+        # review3 P0: the price legs carry a fixed sunk roundtrip cost (~2x taker
+        # slippage on both legs) from the very first tick. The per-round stop-loss
+        # must measure deterioration RELATIVE to the open baseline, otherwise every
+        # freshly opened round trips it on tick #1. Lazily baseline if a pre-fix or
+        # recovered round is missing one.
+        if self.sm.state.get("entry_mtm_usdt") is None:
+            self.sm.set_entry_baseline(float(price_pnl))
+        baseline = D(self.sm.state.get("entry_mtm_usdt") or 0)
+        adverse = total_pnl - baseline   # ~0 at open; only real deterioration/funding moves it
+
         snap["unrealized_price_pnl_usdt"] = price_pnl
         snap["funding_accrued_usdt"] = funding_pnl
         snap["unrealized_total_pnl_usdt"] = total_pnl
+        snap["entry_mtm_usdt"] = baseline
+        snap["round_pnl_vs_entry_usdt"] = adverse
 
         # P0-4: single-leg watchdog. Phase 1 "reality" is the shadow legs (always
         # balanced) so live_positions is None -> OK; the wiring is live for P2.
@@ -215,7 +232,8 @@ class Engine:
         if not should_exit:
             should_exit, reason = strategy.take_profit_signal(total_pnl, self.cfg)
         if not should_exit:
-            should_exit, reason = strategy.round_stop_loss_signal(total_pnl, self.cfg)
+            # measure loss RELATIVE to entry baseline, not absolute (review3 P0)
+            should_exit, reason = strategy.round_stop_loss_signal(adverse, self.cfg)
         if should_exit:
             return self._do_exit(reason, snap)
         return "holding"
@@ -249,7 +267,15 @@ class Engine:
         )
         if result.get("both_filled"):
             self.sm.confirm_hold(result["legs"])
-            self._log(f"[SHADOW OPEN] {direction} {reason} | be_hours={fmt(snap.get('break_even_hours'),2)}")
+            # Baseline the sunk roundtrip cost so the per-round stop-loss measures
+            # deterioration RELATIVE to open, not the model's fixed entry cost.
+            entry_mtm = self.executor.mark_to_market(
+                result["legs"], snap.get("var_price") or ZERO,
+                snap.get("lighter_price") or ZERO, book,
+            )
+            self.sm.set_entry_baseline(float(entry_mtm))
+            self._log(f"[SHADOW OPEN] {direction} {reason} | be_hours={fmt(snap.get('break_even_hours'),2)} "
+                      f"entry_mtm={fmt(entry_mtm,4)}")
             return f"shadow_open:{direction}"
         self.sm.abort_entry("leg_not_filled")
         return "entry_aborted"

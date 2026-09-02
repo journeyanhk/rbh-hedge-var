@@ -47,6 +47,7 @@ def empty_state() -> dict[str, Any]:
         "realized_pnl": 0.0,
         "funding_accrued_usdt": 0.0,   # estimated funding for the open round
         "funding_last_accrual_ts": None,  # last time funding was accrued (P0-1)
+        "entry_mtm_usdt": None,        # price-leg MTM at open (sunk roundtrip cost baseline)
         "daily_pnl": {},
         "round_history": [],
         "shadow": True,
@@ -108,6 +109,15 @@ class StateMachine:
         self.state["opened_at"] = int(time.time())
         self.state["funding_accrued_usdt"] = 0.0
         self.state["funding_last_accrual_ts"] = int(time.time())
+        self.state["entry_mtm_usdt"] = None   # engine fills the baseline right after
+        self.save()
+
+    def set_entry_baseline(self, price_mtm_usdt: float) -> None:
+        """Record the price-leg MTM at open. This is the sunk roundtrip cost the
+        shadow model books immediately (~2x taker slippage on both legs); the
+        per-round stop-loss measures deterioration RELATIVE to this baseline so a
+        freshly opened round is not instantly stopped out (review3 P0)."""
+        self.state["entry_mtm_usdt"] = float(price_mtm_usdt)
         self.save()
 
     def accrue_funding(self, amount_usdt: float) -> float:
@@ -167,6 +177,7 @@ class StateMachine:
         self.state["opened_at"] = None
         self.state["reversal_streak"] = 0
         self.state["funding_accrued_usdt"] = 0.0
+        self.state["entry_mtm_usdt"] = None
         self.state["cooldown_until"] = int(time.time()) + int(cooldown_s)
         self.save()
 
@@ -220,3 +231,19 @@ class StateMachine:
     def clear_halt(self) -> None:
         self.state["halt"] = None
         self.save()
+
+    def clear_halt_and_ledger(self) -> dict[str, Any]:
+        """Clear the HALT latch AND zero the in-memory PnL counters so the next
+        tick does not immediately re-halt on the same distorted daily loss. The
+        append-only shadow_rounds.jsonl is left intact as the historical record.
+        Returns what was cleared for operator visibility."""
+        prior = {
+            "halt": self.state.get("halt"),
+            "realized_pnl": self.state.get("realized_pnl"),
+            "daily_pnl": dict(self.state.get("daily_pnl") or {}),
+        }
+        self.state["halt"] = None
+        self.state["realized_pnl"] = 0.0
+        self.state["daily_pnl"] = {}
+        self.save()
+        return prior
