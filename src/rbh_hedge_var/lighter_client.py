@@ -219,6 +219,33 @@ class LighterReadOnlyClient:
         out.sort(key=lambda x: x["timestamp"])   # positionFunding is newest-first
         return out
 
+    def funding_history_raw(self, symbol: str, *, limit: int = 10,
+                            auth_token: str | None = None) -> dict[str, Any]:
+        """Diagnostic: return the RAW positionFunding body (untouched rows) so a
+        human can see exactly which field a settlement value sits in. Used by the
+        ``funding-raw`` CLI to adjudicate the amount-magnitude question (is the
+        parsed value a USD ``change`` or a per-hour ``rate``?). Same endpoint and
+        fail-closed error handling as ``funding_history``, but no field mapping."""
+        if self.account_index is None:
+            raise LighterError("account_index required for funding history")
+        row = self._market_row(symbol)
+        params: dict[str, Any] = {
+            "account_index": int(self.account_index),
+            "market_ids": str(int(row["market_id"])),
+            "limit": max(1, min(int(limit), 100)),
+        }
+        headers = {"authorization": auth_token} if auth_token else None
+        from urllib.parse import urlencode
+        url = self.base_url + "/api/v1/positionFunding?" + urlencode(params)
+        res = http_util.request_json("GET", url, headers=headers, impersonate=True)
+        body = res.json if isinstance(res.json, dict) else {}
+        code = body.get("code")
+        if res.status >= 400 or (code is not None and int(code) != 200):
+            msg = body.get("message") or (res.text or "")[:200]
+            raise LighterError(
+                f"positionFunding failed (HTTP {res.status}, code {code}): {msg}")
+        return body
+
     # ---- write surface (blocked in Phase 1) --------------------------------
     def place_market_order(self, *args: Any, **kwargs: Any):
         raise LighterError("Phase 1 read-only client cannot place orders (Phase 2 feature)")

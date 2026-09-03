@@ -604,6 +604,33 @@ class Engine:
                   f"samples={att['samples']} expires_at={att['expires_at']}")
         return {"ok": True, "attestation": att, "amount_note": note}
 
+    def funding_raw(self, *, limit: int = 10) -> dict[str, Any]:
+        """Diagnostic: dump the RAW positionFunding rows plus the current quoted
+        funding rate + per-hour USD expectation, so the amount-magnitude question
+        can be adjudicated by eye (parser field vs. venue reality)."""
+        auth = self._funding_auth_token()
+        try:
+            body = self.lighter.funding_history_raw(self.lighter_symbol, limit=limit,
+                                                    auth_token=auth)
+        except Exception as exc:
+            return {"ok": False, "reason": f"raw funding fetch failed: {exc}"}
+        rate = None
+        try:
+            rate = self.lighter.funding_rate(self.lighter_symbol).get("rate")
+        except Exception:
+            pass
+        rows = (body.get("position_fundings") or body.get("fundings")
+                or body.get("funding_payments") or [])
+        expected_usd = (abs(D(rate)) * D(self.notional)) if rate is not None else None
+        return {
+            "ok": True,
+            "symbol": self.lighter_symbol,
+            "quoted_rate_per_interval": str(rate) if rate is not None else None,
+            "notional_usdt": str(self.notional),
+            "expected_usd_per_settlement": str(expected_usd) if expected_usd is not None else None,
+            "raw_rows": rows,
+        }
+
     # ---- helpers -----------------------------------------------------------
     def _safe_book(self) -> dict[str, Any] | None:
         try:

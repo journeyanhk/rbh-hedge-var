@@ -9,6 +9,7 @@ Commands:
   reconcile    (Phase 2) print real signed positions on both venues
   preflight    (Phase 2) go-live readiness table; never disarms/trades
   verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
+  funding-raw  (Phase 2) dump RAW positionFunding rows + rate/USD expectation (diagnostic)
 
 Live execution (Phase 2) is OFF unless ALL hold:
   * config.live_trading = true
@@ -148,6 +149,19 @@ def cmd_verify_funding(cfg) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_funding_raw(cfg) -> int:
+    """Diagnostic: print the RAW positionFunding rows next to the quoted rate and
+    the per-hour USD expectation, to adjudicate the settlement-amount question."""
+    eng = Engine(cfg)
+    limit = int(cfg.get("funding_raw_limit", 10))
+    try:
+        result = eng.funding_raw(limit=limit)
+    finally:
+        eng.close()
+    print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
     live = _maybe_arm_live(cfg, eng)
@@ -202,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_preflight(cfg)
     if command == "verify-funding":
         return cmd_verify_funding(cfg)
+    if command == "funding-raw":
+        return cmd_funding_raw(cfg)
     print(f"unknown command: {command}\n{__doc__}")
     return 2
 
