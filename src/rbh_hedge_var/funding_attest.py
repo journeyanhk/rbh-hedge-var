@@ -84,20 +84,49 @@ def valid_attestation(att: dict[str, Any] | None, venue: str,
     return att
 
 
-def amount_plausibility(rows: list[dict[str, Any]], *, rate: Decimal | None,
-                        notional: Decimal, interval_s: int) -> str:
-    """Best-effort magnitude sanity note (not a hard gate): compare a settlement
-    amount to rate*notional over one interval. Returned as human-readable detail
-    since private amount signs/units vary by venue."""
-    if rate is None or notional <= ZERO:
-        return "amount check skipped (rate/notional unknown)"
-    amounts = [abs(D(r.get("amount") or r.get("funding") or 0)) for r in rows if r]
-    amounts = [a for a in amounts if a > ZERO]
-    if not amounts:
-        return "amount check skipped (no settlement amounts)"
-    observed = sorted(amounts)[len(amounts) // 2]
-    expected = abs(D(rate)) * D(notional)
-    if expected <= ZERO:
-        return "amount check skipped (expected 0)"
-    ratio = observed / expected
-    return f"median settlement {observed} vs expected/interval {expected} (ratio {ratio:.2f})"
+def amount_self_consistent(rows: list[dict[str, Any]], *, mark_price: Any,
+                           tolerance_pct: float = 0.1) -> dict[str, Any]:
+    """Validate settlement amounts against each row's OWN fields (review11).
+
+    Every positionFunding row carries ``rate`` (the settlement rate, e.g.
+    0.000004/h), ``position_size`` (base qty) and ``amount``/``change`` (USD). The
+    identity that must hold is::
+
+        abs(change) ≈ abs(rate) × abs(position_size) × mark_price
+
+    Checking this per-row is immune to the two mistakes that produced the earlier
+    bogus 0.02 ratio: using the 8h-basis QUOTED rate instead of the hourly
+    settlement rate, and using the config notional ($300) instead of the real
+    position ($50). Returns ``{ok, reason, ratio, ...}``. Skips (ok=True) when the
+    rows lack rate/size or mark_price is unknown — inability to check is not a
+    failure; only a computed ratio OUTSIDE tolerance blocks the attestation."""
+    mp = D(mark_price) if mark_price is not None else ZERO
+    if mp <= ZERO:
+        return {"ok": True, "reason": "amount check skipped (mark price unknown)"}
+    ratios: list[Decimal] = []
+    for r in rows or []:
+        if not r:
+            continue
+        rate = r.get("rate")
+        size = r.get("position_size")
+        amt = r.get("amount")
+        if rate is None or size is None or amt is None:
+            continue
+        expected = abs(D(rate)) * abs(D(size)) * mp
+        observed = abs(D(amt))
+        if expected <= ZERO:
+            continue
+        ratios.append(observed / expected)
+    if not ratios:
+        return {"ok": True, "reason": "amount check skipped (rows lack rate/size)"}
+    ratios.sort()
+    ratio = ratios[len(ratios) // 2]
+    tol = D(str(tolerance_pct))
+    ok = (D(1) - tol) <= ratio <= (D(1) + tol)
+    reason = (f"amount self-consistent: median ratio {ratio:.3f} "
+              f"(change ≈ rate×size×mark, n={len(ratios)}, tol±{tol})")
+    if not ok:
+        reason = (f"amount MISMATCH: median ratio {ratio:.3f} outside ±{tol} — "
+                  f"change != rate×size×mark over {len(ratios)} rows; settlement "
+                  f"formula/units not understood, refuse attestation")
+    return {"ok": ok, "reason": reason, "ratio": ratio, "samples": len(ratios)}

@@ -21,6 +21,8 @@
     "chain_id": 466324,
     "account_env_file": ".env",
     "funding_unit": "per_interval",
+    "funding_rate_basis_s": 28800,
+    "//funding_rate_basis_s": "RHC /api/v1/funding-rates quotes an 8h-basis rate (28800s) but SETTLES hourly (3600s). Proven from real positionFunding rows: quoted rate 0.000032 / 8 = settled rate 0.000004 = $0.0002 on $50 notional. Economics normalize the quoted rate over THIS basis, not the settlement interval, else Lighter's hourly edge is overstated 8x. Settlement interval (attestation) stays 3600s.",
     "//phase2_signer": "SignerClient reads LIGHTER_API_KEY_PRIVATE_KEY / LIGHTER_API_KEY_INDEX / LIGHTER_ACCOUNT_INDEX from account_env_file. Requires `pip install lighter-python` on the live host."
   },
 

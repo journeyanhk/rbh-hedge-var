@@ -10,6 +10,44 @@ def test_choose_direction_auto():
     assert strategy.choose_direction(None) is None
 
 
+def test_lighter_rate_normalized_over_8h_basis():
+    # review11: RHC quotes an 8h-basis rate but settles hourly. The economics
+    # must divide the quoted rate by 8, so quoted 0.000032 -> hourly 0.000004.
+    var_asset = {"symbol": "XAU", "price": "4420", "funding_rate": "0",
+                 "funding_interval_s": 14400}
+    lit_contract = {"symbol": "XAU", "mark_price": "4420", "status": "active"}
+    lit_funding = {"rate": "0.000032", "funding_interval_s": None,
+                   "official_interval_s": 3600}
+    cfg = {
+        "expected_variational_funding_interval_s": 14400,
+        "expected_lighter_funding_interval_s": 3600,
+        "variational": {"funding_unit": "annualized"},
+        "lighter": {"funding_unit": "per_interval", "funding_rate_basis_s": 28800},
+        "_attested_lighter_interval_s": 3600,
+    }
+    snap = strategy.market_snapshot(var_asset, lit_contract, lit_funding, cfg)
+    assert snap["lighter_funding_hourly"] == Decimal("0.000004")
+
+
+def test_lighter_rate_without_basis_defaults_to_settlement_interval():
+    # Backward-compat: no funding_rate_basis_s -> falls back to the reference
+    # (settlement) interval, i.e. the pre-review11 behavior of treating the
+    # quoted rate as hourly.
+    var_asset = {"symbol": "XAU", "price": "4420", "funding_rate": "0",
+                 "funding_interval_s": 14400}
+    lit_contract = {"symbol": "XAU", "mark_price": "4420", "status": "active"}
+    lit_funding = {"rate": "0.000032", "funding_interval_s": None,
+                   "official_interval_s": 3600}
+    cfg = {
+        "expected_variational_funding_interval_s": 14400,
+        "expected_lighter_funding_interval_s": 3600,
+        "variational": {"funding_unit": "annualized"},
+        "lighter": {"funding_unit": "per_interval"},
+    }
+    snap = strategy.market_snapshot(var_asset, lit_contract, lit_funding, cfg)
+    assert snap["lighter_funding_hourly"] == Decimal("0.000032")
+
+
 def _snap(**kw):
     base = {
         "spread_hourly": Decimal("0.0001"),

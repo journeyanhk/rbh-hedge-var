@@ -50,8 +50,18 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
                              cfg.get("expected_lighter_funding_interval_s", 3600))
     var_unit = (cfg.get("variational") or {}).get("funding_unit")
     lit_unit = (cfg.get("lighter") or {}).get("funding_unit")
-    var_hourly = funding_guard.normalize_hourly(var_asset.get("funding_rate"), var_ref, var_unit)
-    lit_hourly = funding_guard.normalize_hourly(lighter_funding.get("rate"), lit_ref, lit_unit)
+    # Rate-BASIS period: the quoted rate applies over this many seconds, which
+    # can DIFFER from the settlement interval. RHC Lighter's /funding-rates quotes
+    # an 8h-basis rate (28800s) but SETTLES hourly (3600s) — proven from real
+    # positionFunding rows: quoted 0.000032 / 8 = settled 0.000004. Economics must
+    # normalize a per_interval rate over its BASIS, not the settlement interval,
+    # or Lighter's hourly edge is overstated 8x. Variational's ANNUALIZED figure
+    # is basis-independent (the interval cancels in normalize_hourly), so the
+    # override only matters for Lighter; default to the reference interval.
+    var_basis = int((cfg.get("variational") or {}).get("funding_rate_basis_s") or var_ref)
+    lit_basis = int((cfg.get("lighter") or {}).get("funding_rate_basis_s") or lit_ref)
+    var_hourly = funding_guard.normalize_hourly(var_asset.get("funding_rate"), var_basis, var_unit)
+    lit_hourly = funding_guard.normalize_hourly(lighter_funding.get("rate"), lit_basis, lit_unit)
     unit_warnings = []
     if funding_guard.unit_hint_conflicts(var_asset.get("funding_rate"), var_unit):
         unit_warnings.append(f"variational funding magnitude conflicts with configured unit '{var_unit}'")

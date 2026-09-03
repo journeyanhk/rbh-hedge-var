@@ -64,8 +64,32 @@ def test_verify_units_attested_mismatch_blocks():
     assert res.live_allowed is False
 
 
-def test_amount_plausibility_note():
-    rows = [{"timestamp": 1, "amount": "0.5"}, {"timestamp": 2, "amount": "0.6"}]
-    note = funding_attest.amount_plausibility(rows, rate=D("0.0001"), notional=D("12000"),
-                                              interval_s=3600)
-    assert "ratio" in note
+def test_amount_self_consistent_passes_within_tolerance():
+    # change ≈ rate × position_size × mark_price. 0.000004 × 0.0113 × 4420 ≈ 0.0002
+    rows = [{"timestamp": 1, "amount": "-0.000200", "rate": "0.000004", "position_size": "0.0113"},
+            {"timestamp": 2, "amount": "-0.000199", "rate": "0.000004", "position_size": "0.0113"}]
+    out = funding_attest.amount_self_consistent(rows, mark_price=D("4420"), tolerance_pct=0.1)
+    assert out["ok"] is True
+    assert "ratio" in out
+
+
+def test_amount_self_consistent_fails_out_of_tolerance():
+    # amount is 8x too small vs rate×size×mark -> the old 8h-basis bug signature
+    rows = [{"timestamp": 1, "amount": "-0.000025", "rate": "0.000004", "position_size": "0.0113"}]
+    out = funding_attest.amount_self_consistent(rows, mark_price=D("4420"), tolerance_pct=0.1)
+    assert out["ok"] is False
+    assert "MISMATCH" in out["reason"]
+
+
+def test_amount_self_consistent_skips_without_fields():
+    rows = [{"timestamp": 1, "amount": "0.5"}]  # no rate/size
+    out = funding_attest.amount_self_consistent(rows, mark_price=D("4420"))
+    assert out["ok"] is True
+    assert "skipped" in out["reason"]
+
+
+def test_amount_self_consistent_skips_without_mark_price():
+    rows = [{"timestamp": 1, "amount": "-0.0002", "rate": "0.000004", "position_size": "0.0113"}]
+    out = funding_attest.amount_self_consistent(rows, mark_price=None)
+    assert out["ok"] is True
+    assert "skipped" in out["reason"]

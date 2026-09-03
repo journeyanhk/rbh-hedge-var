@@ -215,7 +215,18 @@ class LighterReadOnlyClient:
                    r.get("funding") if r.get("funding") is not None else
                    r.get("payment") if r.get("payment") is not None else
                    r.get("value") if r.get("value") is not None else 0)
-            out.append({"timestamp": ts, "amount": D(amt)})
+            # Carry the row's OWN rate + position_size so the amount check can
+            # validate change ≈ rate × position_size × mark_price self-contained,
+            # immune to config notional/basis mistakes (review11).
+            rate = r.get("rate")
+            size = (r.get("position_size") if r.get("position_size") is not None
+                    else r.get("size") if r.get("size") is not None else None)
+            out.append({
+                "timestamp": ts,
+                "amount": D(amt),
+                "rate": D(rate) if rate is not None else None,
+                "position_size": D(size) if size is not None else None,
+            })
         out.sort(key=lambda x: x["timestamp"])   # positionFunding is newest-first
         return out
 

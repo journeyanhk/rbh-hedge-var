@@ -582,18 +582,26 @@ class Engine:
             rows, expected_interval_s=expected,
             cadence_tolerance_pct=float(self.cfg.get("funding_cadence_tolerance_pct", 0.2)),
             min_samples=int(self.cfg.get("funding_min_samples", 3)))
-        # magnitude note (advisory only)
-        rate = None
+        # Amount self-consistency (review11): validate each settlement against its
+        # OWN row fields — change ≈ rate × position_size × mark_price — which is
+        # immune to config notional/basis mistakes. A computed ratio outside
+        # tolerance means we don't understand the settlement formula: HARD gate.
+        mark = None
         try:
-            rate = self.lighter.funding_rate(self.lighter_symbol).get("rate")
+            mark = self.lighter.public_contract(self.lighter_symbol).get("mark_price")
         except Exception:
             pass
-        note = funding_attest.amount_plausibility(
-            rows, rate=rate, notional=self.notional, interval_s=expected)
+        amt = funding_attest.amount_self_consistent(
+            rows, mark_price=mark,
+            tolerance_pct=float(self.cfg.get("funding_amount_tolerance_pct", 0.1)))
+        note = amt["reason"]
         if not val["ok"]:
             self.sm.set_funding_attestation(None)
             return {"ok": False, "reason": val["reason"], "samples": val["samples"],
                     "amount_note": note}
+        if not amt["ok"]:
+            self.sm.set_funding_attestation(None)
+            return {"ok": False, "reason": amt["reason"], "amount_note": note}
         att = funding_attest.build_attestation(
             "lighter", int(val["observed_interval_s"]), samples=int(val["samples"]),
             detail=val["reason"],
