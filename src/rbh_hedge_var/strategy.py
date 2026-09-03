@@ -146,6 +146,18 @@ def entry_signal(snap: dict[str, Any], cfg: dict[str, Any]) -> tuple[bool, str, 
         if mode != direction:
             return False, "", f"direction_locked_{mode}_but_signal_{direction}"
 
+    # review12: after the 8x funding correction the XAU carry is thin; single-
+    # round PnL is dominated by basis moves. Optionally require the basis to be
+    # in our favour at entry (short the richer leg) by at least a floor, so we
+    # lock in a cushion that covers most of the round-trip cost and turns "small
+    # loss" into "roughly flat". entry_basis_gain_usdt is computed upstream in
+    # the economics overlay for the chosen direction (0 when basis is adverse).
+    if cfg.get("require_entry_basis_gain", False):
+        gain = D(snap.get("entry_basis_gain_usdt") or 0)
+        floor = D(cfg.get("min_entry_basis_gain_usdt", 0) or 0)
+        if gain < floor:
+            return False, "", f"basis_gain_too_small {gain}U < {floor}U"
+
     if direction == "short_var_long_lighter":
         return True, direction, "short higher-funding Variational, long Lighter"
     return True, direction, "short higher-funding Lighter, long Variational"

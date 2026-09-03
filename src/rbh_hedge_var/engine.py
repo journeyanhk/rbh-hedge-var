@@ -77,6 +77,7 @@ class Engine:
         self._data_fail_streak = 0
         self._reconcile_fail_streak = 0
         self._idle_tick_count = 0
+        self._last_live_positions: dict[str, Any] | None = None
 
     def _build_live_stack(self, vcfg: dict[str, Any], lcfg: dict[str, Any],
                           acct_index: int | None) -> None:
@@ -157,6 +158,12 @@ class Engine:
             "roundtrip_cost_usdt": rt_cost,
             "break_even_hours": be_hours,
             "notional_per_leg_usdt": self.notional,
+            # dashboard: honest LIVE/SHADOW state = live configured AND guard down.
+            "live_armed": bool(self.live_trading and not net_guard.is_armed()),
+            # most recent real dual-venue positions from a live reconcile/watchdog
+            # (None on shadow-only deploys or before the first live read).
+            "live_positions": ({k: str(v) for k, v in self._last_live_positions.items()}
+                               if self._last_live_positions else None),
         })
         return snap
 
@@ -286,6 +293,8 @@ class Engine:
         # P0-4: single-leg watchdog. Phase 1 "reality" is the shadow legs (always
         # balanced) so live_positions is None -> OK; the wiring is live for P2.
         live_positions = self._live_positions()
+        if live_positions is not None:
+            self._last_live_positions = dict(live_positions)   # dashboard cache
         wd = watchdog.check_single_leg(legs, live_positions)
         snap["watchdog_action"] = wd.action
         if not wd.ok:
@@ -492,6 +501,7 @@ class Engine:
             # Transient read failure: log and retry next window rather than HALT.
             self._log(f"[IDLE FLAT-CHECK] reconcile failed (retry next window): {exc}")
             return None
+        self._last_live_positions = dict(live)   # dashboard: last real positions
         tol = self._size_step() / 2
         residual = {k: str(v) for k, v in live.items() if abs(D(v)) > tol}
         if residual:

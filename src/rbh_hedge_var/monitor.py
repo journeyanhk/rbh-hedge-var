@@ -27,7 +27,7 @@ h1{font-size:18px}.tag{background:#f38ba8;color:#11111b;padding:2px 8px;border-r
 table{border-collapse:collapse;margin:12px 0}td,th{border:1px solid #313244;padding:6px 12px;text-align:left}
 .k{color:#89b4fa}.warn{color:#f9e2af}.ok{color:#a6e3a1}.bad{color:#f38ba8}pre{background:#181825;padding:12px;border-radius:6px}</style>
 </head><body>
-<h1>rbh-hedge-var <span class=tag>PHASE 1 · SHADOW · NO REAL ORDERS</span></h1>
+<h1>rbh-hedge-var <span class=tag>funding hedge · see LIVE/SHADOW below</span></h1>
 <div id=body>loading…</div>
 <script>
 async function load(){
@@ -35,13 +35,22 @@ async function load(){
  const s=d.snapshot||{},st=d.state||{};
  const v=st.funding_verified?'<span class=ok>VERIFIED</span>':'<span class=bad>'+(s.funding_unit_status||'unknown')+'</span>';
  const halt=st.halt?('<span class=bad>HALTED: '+(st.halt.reason||'')+'</span>'):'<span class=ok>no</span>';
+ const live=s.live_armed?'<span class=bad>LIVE · REAL ORDERS</span>':'<span class=ok>SHADOW</span>';
+ const lp=s.live_positions?('lighter='+s.live_positions.lighter+' variational='+s.live_positions.variational):'-';
+ // attestation remaining validity (turns red under 12h)
+ let att='-';const ax=st.funding_attestation;
+ if(ax&&ax.expires_at){const rem=ax.expires_at-Math.floor(Date.now()/1000);
+  const hrs=(rem/3600);att=(rem>0?hrs.toFixed(1)+'h left':'EXPIRED');
+  att='<span class="'+(rem<43200?'bad':'ok')+'">'+att+'</span>';}
  let h='<table>';
- const rows=[['mode',st.mode],['halt',halt],['round_id',st.round_id],['direction',st.direction||'-'],
+ const rows=[['LIVE/SHADOW',live],['mode',st.mode],['halt',halt],['round_id',st.round_id],['direction',st.direction||'-'],
   ['candidate_direction',s.candidate_direction||'-'],['funding unit',v],['funding reason',s.funding_unit_reason||''],
+  ['attestation validity',att],['reconciled positions',lp],
   ['var_price',s.var_price],['lighter_price',s.lighter_price],['basis',s.basis],
   ['var_funding_hourly',s.var_funding_hourly],['lighter_funding_hourly',s.lighter_funding_hourly],
   ['spread_hourly',s.spread_hourly],['net_funding_hourly_usdt',s.net_funding_hourly_usdt],
-  ['break_even_hours',s.break_even_hours],
+  ['entry_basis_gain_usdt',s.entry_basis_gain_usdt],['break_even_hours',s.break_even_hours],
+  ['funding_accrued_usdt',st.funding_accrued_usdt],
   ['entry_mtm(sunk cost)',s.entry_mtm_usdt],['unrealized_total_pnl',s.unrealized_total_pnl_usdt],
   ['round_pnl_vs_entry',s.round_pnl_vs_entry_usdt],['realized_pnl(shadow)',st.realized_pnl],
   ['reversal_streak',st.reversal_streak],['last_reason',st.last_reason]];

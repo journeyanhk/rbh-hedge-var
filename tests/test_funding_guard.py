@@ -39,3 +39,15 @@ def test_verify_units_missing_fails_closed():
 def test_verify_units_mismatch_blocks_live():
     res = fg.verify_units(14400, 3600, expected_var_s=3600, expected_lighter_s=3600)
     assert res.status == "mismatch" and not res.live_allowed
+
+
+def test_unit_hint_conflicts_ignores_zero_rate():
+    # review12: a zero funding rate carries no unit info; the magnitude heuristic
+    # would wrongly say "per_interval" and warn on an 'annualized' venue.
+    assert fg.unit_hint_conflicts(Decimal("0"), "annualized") is False
+    assert fg.unit_hint_conflicts(Decimal("0"), "per_interval") is False
+
+
+def test_unit_hint_conflicts_still_flags_real_mismatch():
+    # A large annualized-magnitude rate declared 'per_interval' should still warn.
+    assert fg.unit_hint_conflicts(Decimal("0.25"), "per_interval") is True

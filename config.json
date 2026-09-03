@@ -40,16 +40,22 @@
   "require_funding_unit_verified_for_live": true,
 
   "//entry": "Signals are computed in hourly-normalized funding units.",
-  "entry_spread_threshold_hourly": 0.00002,
+  "entry_spread_threshold_hourly": 0.000003,
+  "//entry_spread_threshold_hourly": "VALIDATION-ROUND TEMP 0.000003 to admit the current ~0.000004 real spread. RESTORE to 0.00006 after the execution-validation round: that is the '<24h break-even' solution 0.45 roundtrip / 24h / $300 ~= 0.0000625/h; thinner signals are not worth entering.",
   "max_entry_price_diff_usdt": 6.0,
   "max_basis_pct": 0.015,
+  "require_entry_basis_gain": false,
+  "min_entry_basis_gain_usdt": 1.0,
+  "//require_entry_basis_gain": "review12 step-3 (long-term): when true, only enter if the chosen direction shorts the RICHER leg by >= min_entry_basis_gain_usdt (post-8x-correction the basis move dominates single-round PnL). Kept FALSE for the execution-validation round so a round can actually fire; flip to true for the standby regime.",
 
   "//exit": "Exit is trigger-based, never a timer.",
   "force_exit_basis_pct": 0.02,
   "exit_on_spread_reversal": true,
   "spread_reversal_confirm_ticks": 3,
-  "take_profit_total_pnl_usdt": 0.0,
-  "max_round_loss_usdt": 8.0,
+  "take_profit_total_pnl_usdt": 1.0,
+  "//take_profit_total_pnl_usdt": "VALIDATION-ROUND: absolute PnL incl. ~$0.45 sunk roundtrip cost; 1.0 = pocket when basis moves ~$0.5/oz our way ($300 notional). Intraday XAU easily reaches this.",
+  "max_round_loss_usdt": 2.0,
+  "//max_round_loss_usdt": "VALIDATION-ROUND: measured RELATIVE to open baseline; $2 on $300 = 0.67%, wide enough yet not painful.",
 
   "//cost": "Round-trip cost model for the break-even projection (measure live before trusting).",
   "assumed_roundtrip_cost_pct": 0.0015,
@@ -71,8 +77,9 @@
 
   "//risk": "Single-leg exposure watchdog + drawdown circuit breaker. max_round_loss_usdt is measured RELATIVE to the open baseline (sunk roundtrip cost excluded). max_daily_loss floor sits above the ~$24 roundtrip cost so a normal round cannot trip it (review3).",
   "single_leg_watchdog_enabled": true,
-  "max_daily_loss_usdt": 50.0,
-  "close_cooldown_seconds": 1200,
+  "max_daily_loss_usdt": 6.0,
+  "//max_daily_loss_usdt": "VALIDATION-ROUND tightened: two failed rounds trip the daily circuit breaker. Raise back for the standby regime.",
+  "close_cooldown_seconds": 3600,
 
   "//alerts": "Telegram alerts for HALT / single-leg / sustained data failure (P0-4). No-op when creds absent. Keys TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in env_file.",
   "telegram": {

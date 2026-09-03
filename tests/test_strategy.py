@@ -78,6 +78,25 @@ def test_entry_signal_positive_spread_shorts_variational():
     assert ok and direction == "short_var_long_lighter"
 
 
+def test_entry_blocked_when_basis_gain_below_floor():
+    # review12: with require_entry_basis_gain, adverse/insufficient basis blocks.
+    cfg = {**CFG, "require_entry_basis_gain": True, "min_entry_basis_gain_usdt": 1.0}
+    ok, _, reason = strategy.entry_signal(_snap(entry_basis_gain_usdt=Decimal("0")), cfg)
+    assert not ok and "basis_gain_too_small" in reason
+
+
+def test_entry_allowed_when_basis_gain_meets_floor():
+    cfg = {**CFG, "require_entry_basis_gain": True, "min_entry_basis_gain_usdt": 1.0}
+    ok, direction, _ = strategy.entry_signal(_snap(entry_basis_gain_usdt=Decimal("1.5")), cfg)
+    assert ok and direction == "short_var_long_lighter"
+
+
+def test_basis_gain_condition_off_by_default():
+    # Without the flag the condition is a no-op even if gain is 0/missing.
+    ok, _, _ = strategy.entry_signal(_snap(), CFG)
+    assert ok
+
+
 def test_entry_blocked_when_spread_unknown():
     ok, _, reason = strategy.entry_signal(_snap(spread_hourly=None), CFG)
     assert not ok and "funding_unit_unknown" in reason

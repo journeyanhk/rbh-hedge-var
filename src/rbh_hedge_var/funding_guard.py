@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from .numeric import D
+from .numeric import ZERO, D
 
 SECONDS_PER_HOUR = Decimal(3600)
 
@@ -82,6 +82,11 @@ def unit_hint_conflicts(rate: Any, unit_hint: str | None) -> bool:
     unit or an extreme market print is surfaced rather than silently trusted.
     """
     if not unit_hint:
+        return False
+    if D(rate) == ZERO:
+        # A zero rate (e.g. Variational funding momentarily flat) trips the
+        # magnitude heuristic toward "per_interval" and would spuriously warn on
+        # an 'annualized' venue. Zero carries no unit information — never warn.
         return False
     hint = unit_hint.strip().lower()
     heuristic = heuristic_is_annualized(rate)
