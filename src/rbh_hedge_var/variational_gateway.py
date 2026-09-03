@@ -60,7 +60,8 @@ class VariationalGatewayError(RuntimeError):
 
 class VariationalOrderGateway:
     def __init__(self, *, base_url: str = VAR_BASE_URL, symbol: str = "XAU",
-                 env_file: str = ".env", cfg: dict[str, Any] | None = None) -> None:
+                 env_file: str = ".env", cfg: dict[str, Any] | None = None,
+                 read_client: Any = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.symbol = symbol.upper()
         self.env_file = env_file
@@ -68,14 +69,18 @@ class VariationalOrderGateway:
         self.scheme = str(vcfg.get("auth_scheme", "token")).lower()
         self.paths = {**_DEFAULT_PATHS, **(vcfg.get("paths") or {})}
         self.impersonate = bool(vcfg.get("impersonate", True))  # Cloudflare
-        # Instrument identity for the RFQ bodies. funding_interval_s is PART of
-        # the instrument identity (XAU = 14400s, NOT the 3600 vo hardcodes); a
-        # wrong value 400s with 'contract not found'. Injected from config
-        # (engine feeds expected_variational_funding_interval_s) so it can be
-        # pinned to the live-metadata value without a code edit.
+        # Instrument identity for the RFQ bodies. These are FALLBACKS: the real
+        # identity is pulled from live metadata (read_client) at quote time so
+        # the instrument is always the venue's actual listing. Hardcoding was the
+        # review16 bug — we sent instrument_type "perpetual_future" but XAU is a
+        # "perpetual_rwa_future", so the venue built an unlisted contract string
+        # (P-XAU-USDC-14400) and 400'd. funding_interval_s is likewise PART of
+        # the instrument identity (XAU=14400, NOT vo's hardcoded 3600).
+        self._read_client = read_client
+        self._meta_cache: dict[str, dict[str, Any]] = {}
         self._funding_interval_s = int(vcfg.get("funding_interval_s") or 14400)
         self._settlement_asset = str(vcfg.get("settlement_asset", "USDC"))
-        self._instrument_type = str(vcfg.get("instrument_type", "perpetual_future"))
+        self._instrument_type = str(vcfg.get("instrument_type", "perpetual_rwa_future"))
         # token scheme creds
         self._token = read_env(env_file, ("VARIATIONAL_TOKEN", "VARIATIONAL_API_TOKEN"))
         # hmac scheme creds
@@ -129,19 +134,46 @@ class VariationalOrderGateway:
         return res.json
 
     # ---- mutating surface (guarded) ---------------------------------------
+    def _instrument_meta(self, sym: str) -> dict[str, Any]:
+        """The instrument descriptor fields the venue expects, pulled from LIVE
+        metadata (the same /api/metadata/supported_assets response Phase 1 already
+        reads) and cached per symbol. Config values are only a fallback for when
+        no read_client is wired or the fetch fails — they must not be the source
+        of truth, because a hardcoded instrument_type/funding_interval yields an
+        unlisted contract string and a 400 (review16). Never raises: on any error
+        we degrade to the config fallbacks."""
+        if sym in self._meta_cache:
+            return self._meta_cache[sym]
+        fi, itype = int(self._funding_interval_s), self._instrument_type
+        settle = self._settlement_asset
+        if self._read_client is not None:
+            try:
+                raw = (self._read_client.asset(sym) or {}).get("raw") or {}
+                if raw.get("funding_interval_s"):
+                    fi = int(raw["funding_interval_s"])
+                if raw.get("instrument_type"):
+                    itype = str(raw["instrument_type"])
+                settle = (raw.get("settlement_asset") or raw.get("settlement_currency")
+                          or raw.get("quote_asset") or settle)
+            except Exception:
+                pass  # keep config fallbacks
+        meta = {"funding_interval_s": fi, "instrument_type": itype,
+                "settlement_asset": settle}
+        self._meta_cache[sym] = meta
+        return meta
+
     def _instrument(self, sym: str) -> dict[str, Any]:
         """The instrument identity object Variational's quote/order bodies wrap
-        the request in (vo var_api.py:314-337). ``funding_interval_s`` is PART of
-        the instrument identity — XAU's official listing is 14400s (not the 3600
-        vo hardcodes for its assets); a wrong value yields a 'contract not found'
-        400. It is injected from the operator's validated config
-        (``expected_variational_funding_interval_s``), which the funding-unit gate
-        already cross-checks against live metadata before any live unlock."""
+        the request in. Its fields are the venue's ACTUAL listing (from live
+        metadata), never our guesses — XAU is a ``perpetual_rwa_future`` settling
+        every 14400s; sending the wrong instrument_type built ``P-XAU-USDC-14400``
+        which the venue rejected as 'unsupported instrument' (review16)."""
+        meta = self._instrument_meta(sym)
         return {
             "underlying": sym,
-            "funding_interval_s": int(self._funding_interval_s),
-            "settlement_asset": self._settlement_asset,
-            "instrument_type": self._instrument_type,
+            "funding_interval_s": int(meta["funding_interval_s"]),
+            "settlement_asset": meta["settlement_asset"],
+            "instrument_type": meta["instrument_type"],
         }
 
     def request_quote(self, qty: Decimal, symbol: str | None = None) -> dict[str, Any]:

@@ -13,7 +13,9 @@
     "funding_unit": "annualized",
     "//phase2_auth": "Order gateway uses the token scheme: a browser-session token (VARIATIONAL_TOKEN) sent as the vr-token COOKIE (verified in vo — NOT Authorization: Bearer, which returns 'No token'). Endpoint paths are the review4 defaults (/api/quotes/indicative, /api/orders/new/market, /api/positions, /api/portfolio) — do NOT re-pin a `paths` override unless the real API moves. Variational's official Trading API is not yet public, so token+frontend endpoints are the only working route. NOTE: vr-token is a session cookie that expires — refresh from browser DevTools (Application -> Cookies -> vr-token) when reconcile 401s.",
     "auth_scheme": "token",
-    "impersonate": true
+    "impersonate": true,
+    "instrument_type": "perpetual_rwa_future",
+    "//instrument_type": "review16: XAU is a perpetual_rwa_future (from live /api/metadata/supported_assets), NOT a plain perpetual_future — sending the wrong type built an unlisted contract string 'P-XAU-USDC-14400' and 400'd. The gateway now pulls instrument_type + funding_interval_s from live metadata at quote time; this is only the fallback when that fetch is unavailable."
   },
   "lighter": {
     "symbol": "XAU",

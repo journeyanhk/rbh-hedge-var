@@ -75,7 +75,7 @@ def test_submit_two_step_schema_and_acceptance(monkeypatch):
     assert inst["underlying"] == "XAU"
     assert inst["funding_interval_s"] == 14400   # XAU listing, not vo's 3600
     assert inst["settlement_asset"] == "USDC"
-    assert inst["instrument_type"] == "perpetual_future"
+    assert inst["instrument_type"] == "perpetual_rwa_future"  # XAU is an RWA perp
     assert qbody["qty"] == "2.7"
     assert "side" not in qbody
     # order: threads quote_id + vo-verified field names.
@@ -83,6 +83,42 @@ def test_submit_two_step_schema_and_acceptance(monkeypatch):
     assert obody["side"] == "sell"
     assert "max_slippage" in obody and "max_slippage_pct" not in obody
     assert "is_reduce_only" in obody and "reduce_only" not in obody
+
+
+class _FakeReadClient:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def asset(self, sym=None):
+        return {"raw": self._raw}
+
+
+def test_instrument_identity_pulled_from_live_metadata(monkeypatch):
+    # review16: the instrument_type/funding_interval come from LIVE metadata, not
+    # config guesses. XAU's real listing is a perpetual_rwa_future @ 14400s;
+    # sending "perpetual_future" built the unlisted P-XAU-USDC-14400 and 400'd.
+    read = _FakeReadClient({"instrument_type": "perpetual_rwa_future",
+                            "funding_interval_s": 14400, "settlement_asset": "USDC"})
+    gw = VariationalOrderGateway(symbol="XAU", env_file=".env",
+                                 cfg={"auth_scheme": "token",
+                                      # deliberately WRONG config fallbacks:
+                                      "instrument_type": "perpetual_future",
+                                      "funding_interval_s": 3600},
+                                 read_client=read)
+    inst = gw._instrument("XAU")
+    assert inst["instrument_type"] == "perpetual_rwa_future"  # metadata wins
+    assert inst["funding_interval_s"] == 14400                # metadata wins
+
+
+def test_instrument_falls_back_to_config_without_read_client():
+    # No read_client (or a failing fetch) -> config fallbacks are used.
+    gw = VariationalOrderGateway(symbol="XAU", env_file=".env",
+                                 cfg={"auth_scheme": "token",
+                                      "instrument_type": "perpetual_rwa_future",
+                                      "funding_interval_s": 14400})
+    inst = gw._instrument("XAU")
+    assert inst["instrument_type"] == "perpetual_rwa_future"
+    assert inst["funding_interval_s"] == 14400
 
 
 def test_quote_missing_quote_id_raises(monkeypatch):

@@ -111,6 +111,7 @@ class Engine:
                 symbol=vcfg.get("symbol", "XAU"),
                 env_file=vcfg.get("token_env_file", ".env"),
                 cfg=vcfg_live,
+                read_client=self.var,   # instrument identity from LIVE metadata
             )
             self._live_executor = LiveExecutor(
                 self.cfg, lighter_signer=self._lighter_signer, var_gateway=self._var_gateway)
