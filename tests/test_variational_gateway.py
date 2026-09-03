@@ -136,6 +136,33 @@ def test_quote_missing_quote_id_raises(monkeypatch):
         gw.submit_market_order("sell", D("2.7"))
 
 
+def test_quote_reads_bid_ask_book_no_price_field(monkeypatch):
+    # The real indicative response has NO 'price' field — only bid/ask/mark_price
+    # (+ quote_id). Sell lifts the bid, buy hits the ask, else mark.
+    gw = _gw(monkeypatch)
+    book = {"quote_id": "q9", "bid": "4483.08", "ask": "4484.46",
+            "mark_price": "4483.77"}
+    monkeypatch.setattr(gw, "_post", lambda path, body: dict(book))
+    assert gw.request_quote(D("0.06"), "XAU", side="sell")["price"] == D("4483.08")
+    assert gw.request_quote(D("0.06"), "XAU", side="buy")["price"] == D("4484.46")
+    assert gw.request_quote(D("0.06"), "XAU")["price"] == D("4483.77")  # mark fallback
+
+
+def test_submit_uses_side_appropriate_ref_price(monkeypatch):
+    gw = _gw(monkeypatch)
+
+    def fake_post(path, body):
+        if "indicative" in path:
+            return {"quote_id": "q9", "bid": "4483.08", "ask": "4484.46",
+                    "mark_price": "4483.77"}
+        return {"rfq_id": "r1", "status": "accepted"}
+
+    monkeypatch.setattr(gw, "_post", fake_post)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = gw.submit_market_order("sell", D("0.06"), symbol="XAU")
+    assert out["ref_price"] == D("4483.08")  # sell -> bid
+
+
 def test_submit_rejected_raises(monkeypatch):
     gw = _gw(monkeypatch)
 

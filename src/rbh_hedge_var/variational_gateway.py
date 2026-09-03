@@ -185,27 +185,41 @@ class VariationalOrderGateway:
             "settlement_asset": meta["settlement_asset"],
         }
 
-    def request_quote(self, qty: Decimal, symbol: str | None = None) -> dict[str, Any]:
+    def request_quote(self, qty: Decimal, symbol: str | None = None,
+                      side: str | None = None) -> dict[str, Any]:
         """Two-step RFQ, step 1: request a firm quote for a size. The body wraps a
         nested ``instrument`` object and carries NO side (side is chosen at order
-        time). Returns {"price", "quote_id"} — the quote_id threads into the order
-        request. Raises on an unusable quote."""
+        time). The venue returns a book-style quote — ``quote_id`` plus ``bid`` /
+        ``ask`` / ``mark_price`` (there is NO single ``price`` field) — so we pick
+        the side-appropriate reference price: a SELL lifts the bid, a BUY hits the
+        ask, and with no side we fall back to mark. Returns {price, quote_id, bid,
+        ask, mark_price}; raises on an unusable quote."""
         sym = (symbol or self.symbol).upper()
         q = self._post(self.paths["indicative"], {
             "instrument": self._instrument(sym),
             "qty": str(D(qty)),
         })
-        price = _first_decimal(q, ("price", "quote_price", "indicative_price", "fill_price"))
         quote_id = q.get("quote_id") or q.get("id") or q.get("rfq_id")
+        bid = _first_decimal(q, ("bid",))
+        ask = _first_decimal(q, ("ask",))
+        mark = _first_decimal(q, ("mark_price", "index_price"))
+        explicit = _first_decimal(q, ("price", "quote_price", "indicative_price", "fill_price"))
+        if side == "sell" and bid is not None:
+            price = bid
+        elif side == "buy" and ask is not None:
+            price = ask
+        else:
+            price = explicit or mark or ask or bid
         if price is None or price <= ZERO:
             raise VariationalGatewayError(f"unusable indicative quote: {q}")
         if quote_id is None:
             raise VariationalGatewayError(f"quote missing quote_id: {q}")
-        return {"price": price, "quote_id": quote_id}
+        return {"price": price, "quote_id": quote_id, "bid": bid, "ask": ask,
+                "mark_price": mark}
 
     def indicative_price(self, side: str, qty: Decimal, symbol: str | None = None) -> Decimal:
-        """Back-compat price probe (side is ignored by the venue at quote time)."""
-        return self.request_quote(qty, symbol)["price"]
+        """Side-aware price probe (sell -> bid, buy -> ask, else mark)."""
+        return self.request_quote(qty, symbol, side=side)["price"]
 
     def submit_market_order(self, side: str, qty: Decimal, *, symbol: str | None = None,
                             reduce_only: bool = False,
@@ -225,7 +239,7 @@ class VariationalOrderGateway:
         if side not in ("buy", "sell"):
             raise VariationalGatewayError(f"bad side {side!r}")
         sym = (symbol or self.symbol).upper()
-        quote = self.request_quote(qty, sym)
+        quote = self.request_quote(qty, sym, side=side)
         ref_price = quote["price"]
         resp = self._post(self.paths["order"], {
             "quote_id": quote["quote_id"],
