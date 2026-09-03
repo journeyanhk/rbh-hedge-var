@@ -321,6 +321,13 @@ class Engine:
         if not should_exit:
             # measure loss RELATIVE to entry baseline, not absolute (review3 P0)
             should_exit, reason = strategy.round_stop_loss_signal(adverse, self.cfg)
+        if not should_exit:
+            # review16: VALIDATION-ONLY time exit — last in the chain so a real
+            # take-profit/stop-loss/reversal always wins. Guarantees a quiet
+            # validation round still exercises the full close/reconcile/ledger
+            # path within max_hold_hours. Disabled (0) for the standby regime.
+            should_exit, reason = strategy.max_hold_exit_signal(
+                self.sm.state.get("opened_at"), self.cfg)
         if should_exit:
             return self._do_exit(reason, snap)
         return "holding"

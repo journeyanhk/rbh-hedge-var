@@ -16,6 +16,7 @@ Direction vocabulary:
 """
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -210,6 +211,26 @@ def round_stop_loss_signal(total_pnl: Any, cfg: dict[str, Any]) -> tuple[bool, s
     pnl = D(total_pnl)
     if pnl <= -limit:
         return True, f"round_stop_loss {pnl} <= -{limit}"
+    return False, ""
+
+
+def max_hold_exit_signal(opened_at: Any, cfg: dict[str, Any],
+                         *, now: float | None = None) -> tuple[bool, str]:
+    """VALIDATION-ONLY time exit. The strategy's real exits are trigger-based
+    (never a timer); this optional guard forces a round to complete the whole
+    open -> confirm -> accrue -> close -> reconcile -> ledger lifecycle within
+    ``max_hold_hours`` so the BACK HALF of the pipeline gets exercised even when
+    no price/funding trigger fires during a quiet validation window. It sits LAST
+    in the exit-priority chain, so a genuine take-profit/stop-loss/reversal still
+    wins. Set ``max_hold_hours`` to 0 (the default) to disable it and restore the
+    pure trigger-based discipline for the standby regime."""
+    hours = float(cfg.get("max_hold_hours", 0) or 0)
+    if hours <= 0 or not opened_at:
+        return False, ""
+    current = time.time() if now is None else now
+    held_h = (current - float(opened_at)) / 3600.0
+    if held_h >= hours:
+        return True, f"max_hold_elapsed {held_h:.1f}h >= {hours}h"
     return False, ""
 
 

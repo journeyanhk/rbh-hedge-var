@@ -153,3 +153,43 @@ def test_take_profit_triggers():
     cfg = {"take_profit_total_pnl_usdt": 5.0}
     should, reason = strategy.take_profit_signal(Decimal("5.5"), cfg)
     assert should and "take_profit" in reason
+
+
+def test_price_diff_gate_disabled_when_zero():
+    # review16: max_entry_price_diff_usdt=0 DISABLES the price-diff gate so a wide
+    # but favourable spread no longer blocks entry.
+    cfg = {**CFG, "max_entry_price_diff_usdt": 0}
+    ok, direction, _ = strategy.entry_signal(_snap(price_diff_abs=Decimal("8.78")), cfg)
+    assert ok and direction == "short_var_long_lighter"
+
+
+def test_price_diff_gate_blocks_when_positive_and_exceeded():
+    ok, _, reason = strategy.entry_signal(_snap(price_diff_abs=Decimal("8.78")), CFG)
+    assert not ok and "price_diff_too_wide" in reason
+
+
+def test_max_hold_exit_triggers_after_elapsed():
+    # review16 validation-only time exit: held >= max_hold_hours -> exit.
+    opened = 1_000_000
+    now = opened + 4 * 3600 + 1
+    should, reason = strategy.max_hold_exit_signal(opened, {"max_hold_hours": 4.0}, now=now)
+    assert should and "max_hold_elapsed" in reason
+
+
+def test_max_hold_exit_silent_before_elapsed():
+    opened = 1_000_000
+    now = opened + 3600  # only 1h in
+    should, _ = strategy.max_hold_exit_signal(opened, {"max_hold_hours": 4.0}, now=now)
+    assert not should
+
+
+def test_max_hold_exit_disabled_when_zero():
+    opened = 1_000_000
+    now = opened + 100 * 3600
+    should, _ = strategy.max_hold_exit_signal(opened, {"max_hold_hours": 0}, now=now)
+    assert not should
+
+
+def test_max_hold_exit_disabled_when_no_open_ts():
+    should, _ = strategy.max_hold_exit_signal(None, {"max_hold_hours": 4.0}, now=9_999_999)
+    assert not should

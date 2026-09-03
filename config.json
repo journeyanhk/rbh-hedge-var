@@ -40,9 +40,10 @@
   "require_funding_unit_verified_for_live": true,
 
   "//entry": "Signals are computed in hourly-normalized funding units.",
-  "entry_spread_threshold_hourly": 0.000002,
-  "//entry_spread_threshold_hourly": "VALIDATION-ROUND TEMP 0.000002 (review15 route B) to immediately admit the current ~0.0000022 real spread and fire ONE live open/close round for the execution report. RESTORE to 0.00006 right after the round completes: that is the '<24h break-even' solution 0.45 roundtrip / 24h / $300 ~= 0.0000625/h; thinner signals are not worth entering.",
-  "max_entry_price_diff_usdt": 6.0,
+  "entry_spread_threshold_hourly": 0.000001,
+  "//entry_spread_threshold_hourly": "VALIDATION-ROUND TEMP 0.000001 (review16) — stably admits the current ~0.0000022/h real spread so rounds fire for full-flow validation. RESTORE to 0.00008 for the standby regime (measured $0.61 roundtrip / 24h / $300 ~= 0.000085/h; thinner signals don't earn back cost).",
+  "max_entry_price_diff_usdt": 0,
+  "//max_entry_price_diff_usdt": "VALIDATION-ROUND: 0 DISABLES the price-diff gate (code gates on max_diff>0) so validation rounds don't get blocked by a wide but favourable spread. RESTORE to ~13 (direction-aware) for the standby regime; the max_basis_pct fuse still protects against de-pegged/stale prices.",
   "max_basis_pct": 0.015,
   "require_entry_basis_gain": false,
   "min_entry_basis_gain_usdt": 1.0,
@@ -56,6 +57,8 @@
   "//take_profit_total_pnl_usdt": "VALIDATION-ROUND: absolute PnL incl. ~$0.45 sunk roundtrip cost; 1.0 = pocket when basis moves ~$0.5/oz our way ($300 notional). Intraday XAU easily reaches this.",
   "max_round_loss_usdt": 2.0,
   "//max_round_loss_usdt": "VALIDATION-ROUND: measured RELATIVE to open baseline; $2 on $300 = 0.67%, wide enough yet not painful.",
+  "max_hold_hours": 4.0,
+  "//max_hold_hours": "VALIDATION-ONLY time exit (review16). 0 = disabled (default discipline: exits are trigger-based, never a timer). 4.0 forces every round to complete the full close/reconcile/ledger path within 4h so quiet windows still exercise the back half of the pipeline. Sits LAST in the exit chain so a real take-profit/stop-loss/reversal always wins. Set back to 0 for the standby regime.",
 
   "//cost": "Round-trip cost model for the break-even projection (measure live before trusting).",
   "assumed_roundtrip_cost_pct": 0.0015,
