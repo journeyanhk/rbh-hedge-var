@@ -8,9 +8,11 @@ executor via private-position reconciliation (rbh-hedge-v2's hard lesson).
 
 Two auth schemes (``variational.auth_scheme``):
   * "token" (DEFAULT) — the接法 verified live in variational-ondo: a browser
-    session Bearer token (VARIATIONAL_TOKEN) against the same omni.variational.io
-    host + Cloudflare impersonation Phase 1 already uses. Paths default to the
-    vo-verified endpoints.
+    session token (VARIATIONAL_TOKEN) sent as the ``vr-token`` COOKIE (NOT an
+    Authorization: Bearer header — the omni frontend ignores Bearer and returns
+    {"message":"No token"}; vo var_api.py:100-118) against the same
+    omni.variational.io host + Cloudflare impersonation Phase 1 already uses.
+    Paths default to the vo-verified endpoints.
   * "hmac" — API-key/secret HMAC-SHA256(ts+method+path+body). Kept for a future
     official API-key programme; UNVERIFIED, opt-in only.
 
@@ -82,7 +84,15 @@ class VariationalOrderGateway:
 
     def _auth_headers(self, method: str, path: str, body_str: str) -> dict[str, str]:
         if self.scheme == "token":
-            return {"Authorization": f"Bearer {self._token}"}
+            # Variational's omni frontend authenticates via the `vr-token`
+            # COOKIE, not an Authorization: Bearer header (vo var_api.py:100-118
+            # tried Bearer, abandoned it — "Try cookie only"). Sending Bearer
+            # gets {"message":"No token"}. Clean the token the same way vo does:
+            # strip whitespace and any accidentally-copied "Bearer " prefix.
+            token = (self._token or "").strip()
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            return {"Cookie": f"vr-token={token}"}
         ts = str(int(time.time() * 1000))
         prehash = f"{ts}{method.upper()}{path}{body_str}"
         sig = hmac.new(self._api_secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()

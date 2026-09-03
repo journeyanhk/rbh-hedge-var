@@ -2,7 +2,7 @@
 
 review4 P0-A/P0-B: an order response is an ACCEPTANCE, never a proven fill, so
 the gateway returns {rfq_id, status, ref_price, terminal_ok} and leaves fill
-truth to position reconciliation. Token Bearer transport is the default scheme.
+truth to position reconciliation. Token vr-token Cookie transport is the default scheme.
 """
 import pytest
 
@@ -93,3 +93,22 @@ def test_avg_entry_price_reads_row(monkeypatch):
         "positions": [{"asset": "XAU", "side": "short", "net_quantity": "2.7",
                        "avg_entry_price": "4331.2"}]})
     assert gw.avg_entry_price("XAU") == D("4331.2")
+
+
+def test_token_auth_uses_vr_token_cookie(monkeypatch):
+    gw = _gw(monkeypatch)
+    h = gw._auth_headers("GET", "/api/positions", "")
+    assert h == {"Cookie": "vr-token=t"}
+    assert "Authorization" not in h  # Bearer is what caused 'No token'
+
+
+def test_token_auth_strips_bearer_prefix(monkeypatch):
+    gw = _gw(monkeypatch)
+    gw._token = "  Bearer abc123  "  # operator pasted the prefix + whitespace
+    assert gw._auth_headers("GET", "/api/positions", "") == {"Cookie": "vr-token=abc123"}
+
+
+def test_hmac_scheme_still_signs(monkeypatch):
+    gw = _gw(monkeypatch, scheme="hmac")
+    h = gw._auth_headers("POST", "/api/orders/new/market", "{}")
+    assert set(h) == {"X-API-KEY", "X-API-TIMESTAMP", "X-API-SIGNATURE"}
