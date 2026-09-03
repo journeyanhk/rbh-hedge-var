@@ -10,6 +10,7 @@ Commands:
   preflight    (Phase 2) go-live readiness table; never disarms/trades
   verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
   funding-raw  (Phase 2) dump RAW positionFunding rows + rate/USD expectation (diagnostic)
+  probe-quote  (Phase 2) discover the accepted /api/quotes/indicative instrument schema (diagnostic)
 
 Live execution (Phase 2) is OFF unless ALL hold:
   * config.live_trading = true
@@ -162,6 +163,66 @@ def cmd_funding_raw(cfg) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_probe_quote(cfg) -> int:
+    """Diagnostic: discover the exact accepted /api/quotes/indicative body schema.
+
+    The venue's serde deserializer reports ONE problem at a time, and crucially a
+    WRONG enum value comes back as 'unknown variant `x`, expected one of ...' —
+    which LISTS the valid variants. So we POST several candidate instrument
+    bodies (base metadata shape, then a range of `kind` discriminator values) and
+    print each response; one run reveals the schema.
+
+    This sends only INDICATIVE QUOTE requests (they open no position), so it is
+    read-only in effect. It briefly disarms the write-guard ONLY to send the
+    probes and re-arms in a finally — no order endpoint is ever touched."""
+    from . import http_util, net_guard
+    from .variational_client import VariationalReadOnlyClient
+    from .variational_gateway import VariationalOrderGateway
+    vcfg = dict(cfg.get("variational", {}))
+    vcfg["funding_interval_s"] = int(cfg.get("expected_variational_funding_interval_s",
+                                             vcfg.get("funding_interval_s", 14400)))
+    base_url = vcfg.get("base_url", "https://omni.variational.io")
+    sym = str(vcfg.get("symbol", "XAU")).upper()
+    read = VariationalReadOnlyClient(base_url=base_url, symbol=sym)
+    gw = VariationalOrderGateway(base_url=base_url, symbol=sym,
+                                 env_file=vcfg.get("token_env_file", ".env"),
+                                 cfg=vcfg, read_client=read)
+    inst = gw._instrument(sym)   # instrument dict from LIVE metadata
+    qty = str(cfg.get("probe_quote_qty", "0.01"))
+    itype = inst["instrument_type"]
+    b_no_type = {k: v for k, v in inst.items() if k != "instrument_type"}
+    candidates: list[tuple[str, dict]] = [
+        ("base(metadata, no kind)", inst),
+        ("kind=instrument_type", {**inst, "kind": itype}),
+        ("kind=type,drop instrument_type", {**b_no_type, "kind": itype}),
+    ]
+    for k in ("perpetual", "perp", "perpetual_future", "perpetual_rwa_future",
+              "rwa", "future", "swap"):
+        candidates.append((f"kind={k}", {**b_no_type, "kind": k}))
+
+    path = gw.paths["indicative"]
+    url = gw.base_url + path
+    print(f"# probing {url} qty={qty} (metadata instrument={inst})", flush=True)
+    net_guard.disarm(LIVE_ARM_TOKEN)   # quote-only; re-armed in finally
+    try:
+        for tag, instrument in candidates:
+            body = {"instrument": instrument, "qty": qty}
+            try:
+                headers = gw._auth_headers("POST", path, "")
+                res = http_util.request_json("POST", url, headers=headers, body=body,
+                                             impersonate=gw.impersonate, timeout=20)
+                print(json.dumps({"tag": tag, "http": res.status,
+                                  "resp": res.text[:400], "sent": instrument},
+                                 ensure_ascii=False, default=str), flush=True)
+            except Exception as exc:
+                print(json.dumps({"tag": tag, "error": f"{type(exc).__name__}: {exc}",
+                                  "sent": instrument}, ensure_ascii=False, default=str),
+                      flush=True)
+    finally:
+        net_guard.arm()
+    return 0
+
+
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
     live = _maybe_arm_live(cfg, eng)
@@ -241,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_verify_funding(cfg)
     if command == "funding-raw":
         return cmd_funding_raw(cfg)
+    if command == "probe-quote":
+        return cmd_probe_quote(cfg)
     print(f"unknown command: {command}\n{__doc__}")
     return 2
 
