@@ -68,6 +68,14 @@ class VariationalOrderGateway:
         self.scheme = str(vcfg.get("auth_scheme", "token")).lower()
         self.paths = {**_DEFAULT_PATHS, **(vcfg.get("paths") or {})}
         self.impersonate = bool(vcfg.get("impersonate", True))  # Cloudflare
+        # Instrument identity for the RFQ bodies. funding_interval_s is PART of
+        # the instrument identity (XAU = 14400s, NOT the 3600 vo hardcodes); a
+        # wrong value 400s with 'contract not found'. Injected from config
+        # (engine feeds expected_variational_funding_interval_s) so it can be
+        # pinned to the live-metadata value without a code edit.
+        self._funding_interval_s = int(vcfg.get("funding_interval_s") or 14400)
+        self._settlement_asset = str(vcfg.get("settlement_asset", "USDC"))
+        self._instrument_type = str(vcfg.get("instrument_type", "perpetual_future"))
         # token scheme creds
         self._token = read_env(env_file, ("VARIATIONAL_TOKEN", "VARIATIONAL_API_TOKEN"))
         # hmac scheme creds
@@ -121,32 +129,68 @@ class VariationalOrderGateway:
         return res.json
 
     # ---- mutating surface (guarded) ---------------------------------------
-    def indicative_price(self, side: str, qty: Decimal, symbol: str | None = None) -> Decimal:
+    def _instrument(self, sym: str) -> dict[str, Any]:
+        """The instrument identity object Variational's quote/order bodies wrap
+        the request in (vo var_api.py:314-337). ``funding_interval_s`` is PART of
+        the instrument identity — XAU's official listing is 14400s (not the 3600
+        vo hardcodes for its assets); a wrong value yields a 'contract not found'
+        400. It is injected from the operator's validated config
+        (``expected_variational_funding_interval_s``), which the funding-unit gate
+        already cross-checks against live metadata before any live unlock."""
+        return {
+            "underlying": sym,
+            "funding_interval_s": int(self._funding_interval_s),
+            "settlement_asset": self._settlement_asset,
+            "instrument_type": self._instrument_type,
+        }
+
+    def request_quote(self, qty: Decimal, symbol: str | None = None) -> dict[str, Any]:
+        """Two-step RFQ, step 1: request a firm quote for a size. The body wraps a
+        nested ``instrument`` object and carries NO side (side is chosen at order
+        time). Returns {"price", "quote_id"} — the quote_id threads into the order
+        request. Raises on an unusable quote."""
         sym = (symbol or self.symbol).upper()
-        q = self._post(self.paths["indicative"], {"asset": sym, "side": side, "quantity": str(D(qty))})
+        q = self._post(self.paths["indicative"], {
+            "instrument": self._instrument(sym),
+            "qty": str(D(qty)),
+        })
         price = _first_decimal(q, ("price", "quote_price", "indicative_price", "fill_price"))
+        quote_id = q.get("quote_id") or q.get("id") or q.get("rfq_id")
         if price is None or price <= ZERO:
             raise VariationalGatewayError(f"unusable indicative quote: {q}")
-        return price
+        if quote_id is None:
+            raise VariationalGatewayError(f"quote missing quote_id: {q}")
+        return {"price": price, "quote_id": quote_id}
+
+    def indicative_price(self, side: str, qty: Decimal, symbol: str | None = None) -> Decimal:
+        """Back-compat price probe (side is ignored by the venue at quote time)."""
+        return self.request_quote(qty, symbol)["price"]
 
     def submit_market_order(self, side: str, qty: Decimal, *, symbol: str | None = None,
                             reduce_only: bool = False,
-                            max_slippage_pct: Decimal = D("0.002")) -> dict[str, Any]:
+                            max_slippage_pct: Decimal = D("0.005")) -> dict[str, Any]:
         """Submit a market order. Returns an ACCEPTANCE record (rfq_id + ref
         price) — NOT a proven fill. The caller MUST confirm the fill by position
         reconciliation. Raises if the guard is armed, creds are missing, or the
-        venue rejects the order outright."""
+        venue rejects the order outright.
+
+        Two-step RFQ: request ONE quote (price + quote_id), then submit the order
+        referencing that quote_id. Field names are the vo-verified ones
+        (``is_reduce_only``, ``max_slippage``) — NOT ``reduce_only``/
+        ``max_slippage_pct`` (var_api.py:350-365)."""
         if net_guard.is_armed():
             raise net_guard.WriteBlockedError(
                 "write-guard armed: refusing Variational submit_market_order (net_guard.disarm to go live)")
         if side not in ("buy", "sell"):
             raise VariationalGatewayError(f"bad side {side!r}")
         sym = (symbol or self.symbol).upper()
-        ref_price = self.indicative_price(side, qty, sym)
+        quote = self.request_quote(qty, sym)
+        ref_price = quote["price"]
         resp = self._post(self.paths["order"], {
-            "asset": sym, "side": side, "quantity": str(D(qty)),
-            "type": "market", "reduce_only": reduce_only,
-            "max_slippage_pct": str(max_slippage_pct),
+            "quote_id": quote["quote_id"],
+            "side": side,
+            "max_slippage": float(D(max_slippage_pct)),
+            "is_reduce_only": bool(reduce_only),
         })
         rfq_id = resp.get("rfq_id") or resp.get("order_id") or resp.get("id")
         status = str(resp.get("status") or "").lower()

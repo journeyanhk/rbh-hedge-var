@@ -46,14 +46,17 @@ def test_missing_creds_fail_closed(monkeypatch):
         gw.submit_market_order("sell", D("2.7"))
 
 
-def test_submit_returns_acceptance_not_trusted_fill(monkeypatch):
+def test_submit_two_step_schema_and_acceptance(monkeypatch):
+    # review14: the quote body wraps a nested `instrument` identity object and
+    # carries NO side; the order body threads the returned quote_id with the
+    # vo-verified field names (side, max_slippage, is_reduce_only).
     gw = _gw(monkeypatch)
     posts = []
 
     def fake_post(path, body):
         posts.append((path, body))
         if "indicative" in path:
-            return {"price": "4330.5"}
+            return {"price": "4330.5", "quote_id": "q-42"}
         return {"rfq_id": "r1", "status": "accepted", "fill_price": "4330.4"}
 
     monkeypatch.setattr(gw, "_post", fake_post)
@@ -65,19 +68,61 @@ def test_submit_returns_acceptance_not_trusted_fill(monkeypatch):
     assert out["terminal_ok"] is False
     assert len(posts) == 2  # indicative then order
 
+    (qpath, qbody), (opath, obody) = posts
+    # quote: nested instrument identity, string qty, NO side.
+    assert "indicative" in qpath
+    inst = qbody["instrument"]
+    assert inst["underlying"] == "XAU"
+    assert inst["funding_interval_s"] == 14400   # XAU listing, not vo's 3600
+    assert inst["settlement_asset"] == "USDC"
+    assert inst["instrument_type"] == "perpetual_future"
+    assert qbody["qty"] == "2.7"
+    assert "side" not in qbody
+    # order: threads quote_id + vo-verified field names.
+    assert obody["quote_id"] == "q-42"
+    assert obody["side"] == "sell"
+    assert "max_slippage" in obody and "max_slippage_pct" not in obody
+    assert "is_reduce_only" in obody and "reduce_only" not in obody
+
+
+def test_quote_missing_quote_id_raises(monkeypatch):
+    # A quote without a usable quote_id can't thread into an order -> fail closed.
+    gw = _gw(monkeypatch)
+    monkeypatch.setattr(gw, "_post", lambda path, body: {"price": "4330"})
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(VariationalGatewayError):
+        gw.submit_market_order("sell", D("2.7"))
+
 
 def test_submit_rejected_raises(monkeypatch):
     gw = _gw(monkeypatch)
 
     def fake_post(path, body):
         if "indicative" in path:
-            return {"price": "4330"}
+            return {"price": "4330", "quote_id": "q-1"}
         return {"rfq_id": "r1", "status": "rejected"}
 
     monkeypatch.setattr(gw, "_post", fake_post)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     with pytest.raises(VariationalGatewayError):
         gw.submit_market_order("sell", D("2.7"))
+
+
+def test_funding_interval_from_cfg_flows_into_instrument(monkeypatch):
+    # The instrument's funding_interval_s is injected from config, not hardcoded.
+    gw = VariationalOrderGateway(symbol="XAU", env_file=".env",
+                                 cfg={"auth_scheme": "token", "funding_interval_s": 7200})
+    gw._token = "t"
+    captured = {}
+
+    def fake_post(path, body):
+        captured[path] = body
+        return {"price": "1", "quote_id": "q"}
+
+    monkeypatch.setattr(gw, "_post", fake_post)
+    gw.request_quote(D("1"), "XAU")
+    inst = next(iter(captured.values()))["instrument"]
+    assert inst["funding_interval_s"] == 7200
 
 
 def test_signed_position_short_is_negative(monkeypatch):

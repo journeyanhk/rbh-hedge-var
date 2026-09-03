@@ -97,11 +97,20 @@ class Engine:
                 api_key_index=int(read_env(env_file, ("LIGHTER_API_KEY_INDEX",)) or 0),
                 read_client=self.lighter,
             )
+            # funding_interval_s is part of the instrument identity in the RFQ
+            # bodies (XAU=14400, not vo's hardcoded 3600). Feed the operator's
+            # validated expected interval into the gateway cfg so the quote/order
+            # instrument object carries the correct listing; the funding-unit gate
+            # already cross-checks this value against live metadata before unlock.
+            vcfg_live = {**vcfg,
+                         "funding_interval_s": int(
+                             self.cfg.get("expected_variational_funding_interval_s",
+                                          vcfg.get("funding_interval_s", 14400)))}
             self._var_gateway = VariationalOrderGateway(
                 base_url=vcfg.get("base_url", "https://omni.variational.io"),
                 symbol=vcfg.get("symbol", "XAU"),
                 env_file=vcfg.get("token_env_file", ".env"),
-                cfg=vcfg,
+                cfg=vcfg_live,
             )
             self._live_executor = LiveExecutor(
                 self.cfg, lighter_signer=self._lighter_signer, var_gateway=self._var_gateway)
