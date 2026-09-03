@@ -16,7 +16,7 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
-from . import economics, net_guard, pricing
+from . import economics, pricing
 from .numeric import ZERO, D
 
 
@@ -41,7 +41,16 @@ class ShadowLeg:
 
 
 class ShadowExecutor:
-    """Never touches the network. net_guard stays armed the whole time."""
+    """Models a two-leg hedge in pure computation — NEVER touches the network.
+
+    Safety belongs to net_guard's transport layer and the two real gateways, not
+    to this pricing-only simulator. It intentionally does NOT assert the guard
+    state: under a live deploy the ShadowExecutor still has two legitimate jobs —
+    managing a leftover shadow round persisted in state.json, and degraded
+    modeling when a live gate lapses mid-round (e.g. attestation expiry). Coupling
+    it to net_guard armed/disarmed was a false dependency that crashed every tick
+    when a live deploy carried a shadow HOLDING round (review13).
+    """
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
@@ -56,8 +65,7 @@ class ShadowExecutor:
                    lit_size_step: Decimal,
                    lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
                    var_symbol: str = "XAU", lit_symbol: str = "XAU") -> dict[str, Any]:
-        assert net_guard.is_armed(), "shadow executor requires the write-guard armed"
-
+        # No guard assertion: this simulator sends no orders (review13).
         if direction == "short_var_long_lighter":
             var_side, lit_side = "sell", "buy"
         else:
@@ -95,7 +103,7 @@ class ShadowExecutor:
     def close_hedge(self, legs: list[dict[str, Any]],
                     var_price: Decimal, lit_price: Decimal,
                     lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None) -> dict[str, Any]:
-        assert net_guard.is_armed(), "shadow executor requires the write-guard armed"
+        # No guard assertion: pure pricing, no network (review13).
         # Close the illiquid leg first (Variational RFQ) then Lighter — mirrors
         # the live ordering we will use in Phase 2.
         price_pnl = ZERO
@@ -129,5 +137,5 @@ class ShadowExecutor:
         Reuses the exact executable-VWAP close pricing but persists nothing.
         Returns Decimal USDT (may be negative).
         """
-        assert net_guard.is_armed(), "shadow executor requires the write-guard armed"
+        # No guard assertion: pure pricing, no network (review13).
         return pricing.mark_to_market_legs(legs, var_price, lit_price, lit_book, self.slippage)

@@ -165,6 +165,19 @@ def cmd_funding_raw(cfg) -> int:
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
     live = _maybe_arm_live(cfg, eng)
+    # review13: a LIVE deploy carrying a shadow round left in state.json will be
+    # MTM-modeled by the (order-less) ShadowExecutor every tick. That is safe but
+    # usually unintended — surface it loudly at startup rather than silently.
+    if live and eng.sm.mode in ("HOLDING", "EXITING", "ENTERING") \
+            and bool(eng.sm.state.get("shadow", True)):
+        warn = (f"⚠️ LIVE deploy carrying a SHADOW round (mode={eng.sm.mode}) from "
+                "state.json — it sends no orders but pollutes PnL. If unintended: "
+                "stop, back up & reset state.json, restart.")
+        print(f"[run] {warn}", flush=True)
+        try:
+            eng.tg.send(warn)
+        except Exception:
+            pass
     serve(cfg.get("state_file", "state.json"),
           get_snapshot=lambda: _display(eng.last_snapshot),
           host=cfg.get("monitor_bind", "127.0.0.1"),
@@ -172,21 +185,31 @@ def cmd_run(cfg) -> int:
     interval = int(cfg.get("poll_interval_seconds", 60))
     mode = "LIVE" if live else "shadow"
     print(f"[run] {mode} engine started; poll={interval}s. Ctrl-C to stop.", flush=True)
+    last_err: str | None = None
+    err_streak = 0
     try:
         while True:
             # P1-6: a tick raising must never kill the loop silently. Catch,
             # log, alert (best-effort Telegram), and keep polling.
             try:
                 result = eng.tick()
+                last_err, err_streak = None, 0
                 print(f"[tick] mode={result.get('mode')} "
                       f"action={result.get('action') or result.get('error')}", flush=True)
             except Exception as exc:
                 msg = f"{type(exc).__name__}: {exc}"
                 print(f"[tick] UNCAUGHT {msg}", flush=True)
-                try:
-                    eng.tg.send(f"⚠️ engine tick crashed (loop continues): {msg}")
-                except Exception:
-                    pass
+                # review13: don't flood TG every tick, and don't stay silent for
+                # a per-minute crash loop either. Alert on the first occurrence
+                # and once more when it has clearly persisted (3 in a row).
+                err_streak = err_streak + 1 if msg == last_err else 1
+                last_err = msg
+                if err_streak in (1, 3):
+                    try:
+                        eng.tg.send(f"⚠️ engine tick error x{err_streak} "
+                                    f"(loop continues): {msg}")
+                    except Exception:
+                        pass
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n[run] stopped.", flush=True)
