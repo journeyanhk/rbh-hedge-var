@@ -76,6 +76,7 @@ def test_submit_two_step_schema_and_acceptance(monkeypatch):
     assert inst["funding_interval_s"] == 14400   # XAU listing, not vo's 3600
     assert inst["settlement_asset"] == "USDC"
     assert inst["instrument_type"] == "perpetual_rwa_future"  # XAU is an RWA perp
+    assert inst["kind"] == "commodity"           # asset-class discriminator
     assert qbody["qty"] == "2.7"
     assert "side" not in qbody
     # order: threads quote_id + vo-verified field names.
@@ -94,20 +95,23 @@ class _FakeReadClient:
 
 
 def test_instrument_identity_pulled_from_live_metadata(monkeypatch):
-    # review16: the instrument_type/funding_interval come from LIVE metadata, not
-    # config guesses. XAU's real listing is a perpetual_rwa_future @ 14400s;
-    # sending "perpetual_future" built the unlisted P-XAU-USDC-14400 and 400'd.
+    # review16: the instrument_type/funding_interval/kind come from LIVE metadata,
+    # not config guesses. XAU's real listing is a perpetual_rwa_future @ 14400s in
+    # the commodity asset class; wrong values 400'd.
     read = _FakeReadClient({"instrument_type": "perpetual_rwa_future",
-                            "funding_interval_s": 14400, "settlement_asset": "USDC"})
+                            "funding_interval_s": 14400, "settlement_asset": "USDC",
+                            "asset_class": "commodity"})
     gw = VariationalOrderGateway(symbol="XAU", env_file=".env",
                                  cfg={"auth_scheme": "token",
                                       # deliberately WRONG config fallbacks:
                                       "instrument_type": "perpetual_future",
+                                      "asset_class": "equity",
                                       "funding_interval_s": 3600},
                                  read_client=read)
     inst = gw._instrument("XAU")
     assert inst["instrument_type"] == "perpetual_rwa_future"  # metadata wins
     assert inst["funding_interval_s"] == 14400                # metadata wins
+    assert inst["kind"] == "commodity"                        # metadata wins
 
 
 def test_instrument_falls_back_to_config_without_read_client():
@@ -115,10 +119,12 @@ def test_instrument_falls_back_to_config_without_read_client():
     gw = VariationalOrderGateway(symbol="XAU", env_file=".env",
                                  cfg={"auth_scheme": "token",
                                       "instrument_type": "perpetual_rwa_future",
+                                      "asset_class": "commodity",
                                       "funding_interval_s": 14400})
     inst = gw._instrument("XAU")
     assert inst["instrument_type"] == "perpetual_rwa_future"
     assert inst["funding_interval_s"] == 14400
+    assert inst["kind"] == "commodity"
 
 
 def test_quote_missing_quote_id_raises(monkeypatch):

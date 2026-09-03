@@ -81,6 +81,10 @@ class VariationalOrderGateway:
         self._funding_interval_s = int(vcfg.get("funding_interval_s") or 14400)
         self._settlement_asset = str(vcfg.get("settlement_asset", "USDC"))
         self._instrument_type = str(vcfg.get("instrument_type", "perpetual_rwa_future"))
+        # `kind` is the venue's ASSET-CLASS discriminator on the instrument enum
+        # (probe-quote revealed the valid set: ETF/equity/index/commodity). XAU is
+        # a commodity; the real value is metadata's asset_class field.
+        self._asset_class = str(vcfg.get("asset_class", "commodity"))
         # token scheme creds
         self._token = read_env(env_file, ("VARIATIONAL_TOKEN", "VARIATIONAL_API_TOKEN"))
         # hmac scheme creds
@@ -145,7 +149,7 @@ class VariationalOrderGateway:
         if sym in self._meta_cache:
             return self._meta_cache[sym]
         fi, itype = int(self._funding_interval_s), self._instrument_type
-        settle = self._settlement_asset
+        settle, aclass = self._settlement_asset, self._asset_class
         if self._read_client is not None:
             try:
                 raw = (self._read_client.asset(sym) or {}).get("raw") or {}
@@ -153,27 +157,32 @@ class VariationalOrderGateway:
                     fi = int(raw["funding_interval_s"])
                 if raw.get("instrument_type"):
                     itype = str(raw["instrument_type"])
+                if raw.get("asset_class"):
+                    aclass = str(raw["asset_class"])
                 settle = (raw.get("settlement_asset") or raw.get("settlement_currency")
                           or raw.get("quote_asset") or settle)
             except Exception:
                 pass  # keep config fallbacks
         meta = {"funding_interval_s": fi, "instrument_type": itype,
-                "settlement_asset": settle}
+                "settlement_asset": settle, "asset_class": aclass}
         self._meta_cache[sym] = meta
         return meta
 
     def _instrument(self, sym: str) -> dict[str, Any]:
         """The instrument identity object Variational's quote/order bodies wrap
         the request in. Its fields are the venue's ACTUAL listing (from live
-        metadata), never our guesses — XAU is a ``perpetual_rwa_future`` settling
-        every 14400s; sending the wrong instrument_type built ``P-XAU-USDC-14400``
-        which the venue rejected as 'unsupported instrument' (review16)."""
+        metadata), never our guesses. Probe-quote (review16) proved the shape:
+        the instrument enum is tagged by ``kind`` = the ASSET CLASS
+        (commodity/equity/index/etf), and additionally needs ``instrument_type``
+        (XAU = perpetual_rwa_future) + underlying + funding_interval_s +
+        settlement_asset. A wrong/absent kind or type is a 400."""
         meta = self._instrument_meta(sym)
         return {
+            "kind": meta["asset_class"],
+            "instrument_type": meta["instrument_type"],
             "underlying": sym,
             "funding_interval_s": int(meta["funding_interval_s"]),
             "settlement_asset": meta["settlement_asset"],
-            "instrument_type": meta["instrument_type"],
         }
 
     def request_quote(self, qty: Decimal, symbol: str | None = None) -> dict[str, Any]:

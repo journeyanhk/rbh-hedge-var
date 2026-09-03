@@ -187,18 +187,20 @@ def cmd_probe_quote(cfg) -> int:
     gw = VariationalOrderGateway(base_url=base_url, symbol=sym,
                                  env_file=vcfg.get("token_env_file", ".env"),
                                  cfg=vcfg, read_client=read)
-    inst = gw._instrument(sym)   # instrument dict from LIVE metadata
+    inst = gw._instrument(sym)   # instrument dict from LIVE metadata (now incl. kind)
     qty = str(cfg.get("probe_quote_qty", "0.01"))
-    itype = inst["instrument_type"]
-    b_no_type = {k: v for k, v in inst.items() if k != "instrument_type"}
+    # inst already carries the probe-discovered schema (kind=asset_class +
+    # instrument_type); try it FIRST so a clean run confirms a price or names the
+    # next missing field. The rest are fallback variations if the venue moved.
     candidates: list[tuple[str, dict]] = [
-        ("base(metadata, no kind)", inst),
-        ("kind=instrument_type", {**inst, "kind": itype}),
-        ("kind=type,drop instrument_type", {**b_no_type, "kind": itype}),
+        ("corrected(kind=asset_class)", inst),
     ]
-    for k in ("perpetual", "perp", "perpetual_future", "perpetual_rwa_future",
-              "rwa", "future", "swap"):
-        candidates.append((f"kind={k}", {**b_no_type, "kind": k}))
+    for k in ("commodity", "CMD", "equity", "index", "etf"):
+        candidates.append((f"kind={k}", {**inst, "kind": k}))
+    # bare shapes (diagnose which fields are still required if the above 400)
+    candidates.append(("no kind", {k: v for k, v in inst.items() if k != "kind"}))
+    candidates.append(("no instrument_type",
+                       {k: v for k, v in inst.items() if k != "instrument_type"}))
 
     path = gw.paths["indicative"]
     url = gw.base_url + path

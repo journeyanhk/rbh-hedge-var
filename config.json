@@ -15,7 +15,9 @@
     "auth_scheme": "token",
     "impersonate": true,
     "instrument_type": "perpetual_rwa_future",
-    "//instrument_type": "review16: XAU is a perpetual_rwa_future (from live /api/metadata/supported_assets), NOT a plain perpetual_future — sending the wrong type built an unlisted contract string 'P-XAU-USDC-14400' and 400'd. The gateway now pulls instrument_type + funding_interval_s from live metadata at quote time; this is only the fallback when that fetch is unavailable."
+    "//instrument_type": "review16: XAU is a perpetual_rwa_future (from live /api/metadata/supported_assets), NOT a plain perpetual_future — sending the wrong type built an unlisted contract string 'P-XAU-USDC-14400' and 400'd. The gateway now pulls instrument_type + funding_interval_s from live metadata at quote time; this is only the fallback when that fetch is unavailable.",
+    "asset_class": "commodity",
+    "//asset_class": "review16 probe-quote: the instrument body needs a `kind` = asset-class discriminator (valid set ETF/equity/index/commodity). XAU=commodity. Pulled from metadata.asset_class at quote time; this is the fallback."
   },
   "lighter": {
     "symbol": "XAU",
