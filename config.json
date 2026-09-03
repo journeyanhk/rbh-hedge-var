@@ -40,8 +40,8 @@
   "require_funding_unit_verified_for_live": true,
 
   "//entry": "Signals are computed in hourly-normalized funding units.",
-  "entry_spread_threshold_hourly": 0.000003,
-  "//entry_spread_threshold_hourly": "VALIDATION-ROUND TEMP 0.000003 to admit the current ~0.000004 real spread. RESTORE to 0.00006 after the execution-validation round: that is the '<24h break-even' solution 0.45 roundtrip / 24h / $300 ~= 0.0000625/h; thinner signals are not worth entering.",
+  "entry_spread_threshold_hourly": 0.000002,
+  "//entry_spread_threshold_hourly": "VALIDATION-ROUND TEMP 0.000002 (review15 route B) to immediately admit the current ~0.0000022 real spread and fire ONE live open/close round for the execution report. RESTORE to 0.00006 right after the round completes: that is the '<24h break-even' solution 0.45 roundtrip / 24h / $300 ~= 0.0000625/h; thinner signals are not worth entering.",
   "max_entry_price_diff_usdt": 6.0,
   "max_basis_pct": 0.015,
   "require_entry_basis_gain": false,
