@@ -81,17 +81,52 @@ def test_submit_rejected_raises(monkeypatch):
 
 
 def test_signed_position_short_is_negative(monkeypatch):
+    # Real /api/positions is a bare LIST; each row nests data under position_info
+    # with instrument.underlying. Unsigned qty + side="short" -> negate.
+    gw = _gw(monkeypatch)
+    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: [
+        {"position_info": {"qty": "2.7", "side": "short",
+                           "instrument": {"underlying": "XAU"}}}])
+    assert gw.signed_position("XAU") == D("-2.7")
+
+
+def test_signed_position_keeps_signed_qty(monkeypatch):
+    # If qty already carries its sign, the side guard must be a no-op.
+    gw = _gw(monkeypatch)
+    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: [
+        {"position_info": {"qty": "-2.7", "instrument": {"underlying": "XAU"}}}])
+    assert gw.signed_position("XAU") == D("-2.7")
+
+
+def test_signed_position_flat_when_symbol_absent(monkeypatch):
+    gw = _gw(monkeypatch)
+    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: [
+        {"position_info": {"qty": "1.0", "instrument": {"underlying": "ETH"}}}])
+    assert gw.signed_position("XAU") == D("0")
+
+
+def test_signed_position_raises_on_unrecognized_row(monkeypatch):
+    # Fail-CLOSED: a row missing position_info must RAISE, never read as flat.
+    gw = _gw(monkeypatch)
+    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: [
+        {"asset": "XAU", "net_quantity": "2.7"}])
+    with pytest.raises(VariationalGatewayError):
+        gw.signed_position("XAU")
+
+
+def test_signed_position_raises_when_payload_not_list(monkeypatch):
     gw = _gw(monkeypatch)
     monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: {
-        "positions": [{"asset": "XAU", "side": "short", "net_quantity": "2.7"}]})
-    assert gw.signed_position("XAU") == D("-2.7")
+        "positions": [{"asset": "XAU"}]})
+    with pytest.raises(VariationalGatewayError):
+        gw.signed_position("XAU")
 
 
 def test_avg_entry_price_reads_row(monkeypatch):
     gw = _gw(monkeypatch)
-    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: {
-        "positions": [{"asset": "XAU", "side": "short", "net_quantity": "2.7",
-                       "avg_entry_price": "4331.2"}]})
+    monkeypatch.setattr(gw, "_get_authed", lambda path, params=None: [
+        {"position_info": {"qty": "2.7", "side": "short", "avg_entry_price": "4331.2",
+                           "instrument": {"underlying": "XAU"}}}])
     assert gw.avg_entry_price("XAU") == D("4331.2")
 
 

@@ -160,31 +160,54 @@ class VariationalOrderGateway:
         }
 
     # ---- reconciliation ----------------------------------------------------
-    def _position_row(self, symbol: str) -> dict[str, Any] | None:
+    def _position_info(self, symbol: str) -> dict[str, Any] | None:
+        """Nested position row for ``symbol`` from ``/api/positions``.
+
+        The omni endpoint returns a bare LIST of rows; each row nests the real
+        data under ``position_info`` (qty + instrument), verified against vo's
+        executor.py::_position_qty_var. FAIL-CLOSED: if the payload is not a
+        list, or a row is present but not in the expected shape, we RAISE rather
+        than skip it — silently reading an unrecognized structure as "no
+        position" is a dangerous fail-open that would make the single-leg
+        watchdog think a live leg vanished. An empty list (genuinely flat) is
+        fine and returns None."""
         sym = symbol.upper()
         data = self._get_authed(self.paths["positions"])
-        rows = data.get("positions") if isinstance(data, dict) else data
-        if not isinstance(rows, list):
-            return None
-        for r in rows:
-            if str(r.get("asset") or r.get("symbol") or "").upper() == sym:
-                return r
+        if not isinstance(data, list):
+            raise VariationalGatewayError(
+                f"positions payload not a list: {type(data).__name__} {str(data)[:160]}")
+        for row in data:
+            if not isinstance(row, dict):
+                raise VariationalGatewayError(f"unrecognized position row: {str(row)[:200]}")
+            info = row.get("position_info")
+            if not isinstance(info, dict):
+                raise VariationalGatewayError(
+                    f"position row missing position_info: {str(row)[:200]}")
+            inst = info.get("instrument") or {}
+            if str(inst.get("underlying") or inst.get("symbol") or "").upper() == sym:
+                return info
         return None
 
     def signed_position(self, symbol: str | None = None) -> Decimal:
-        row = self._position_row((symbol or self.symbol).upper())
-        if not row:
+        info = self._position_info((symbol or self.symbol).upper())
+        if info is None:
             return ZERO
-        qty = _first_decimal(row, ("net_quantity", "position", "quantity", "size")) or ZERO
-        if str(row.get("side") or "").lower() == "short" and qty > ZERO:
+        qty = _first_decimal(info, ("qty", "net_quantity", "quantity", "size")) or ZERO
+        # Defensive sign: if qty is reported UNSIGNED but a side/direction field
+        # marks a short/sell, force it negative. If qty already carries its sign
+        # (vo accumulates signed qty), the qty>0 guard makes this a no-op.
+        side = str(info.get("side") or info.get("direction")
+                   or (info.get("instrument") or {}).get("side") or "").lower()
+        if qty > ZERO and side in ("short", "sell"):
             qty = -qty
         return qty
 
     def avg_entry_price(self, symbol: str | None = None) -> Decimal | None:
-        row = self._position_row((symbol or self.symbol).upper())
-        if not row:
+        info = self._position_info((symbol or self.symbol).upper())
+        if info is None:
             return None
-        return _first_decimal(row, ("avg_entry_price", "avg_price", "entry_price", "average_price"))
+        return _first_decimal(info, ("avg_entry_price", "avg_price", "entry_price",
+                                     "average_price", "avg_execution_price", "avg_cost"))
 
 
 def _first_decimal(row: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
