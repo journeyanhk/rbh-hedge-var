@@ -102,6 +102,39 @@ def test_entry_signal_positive_spread_shorts_variational():
     assert ok and direction == "short_var_long_lighter"
 
 
+def test_entry_blocked_when_var_market_closed():
+    # var-desgin6: session gate. Closed market -> never open.
+    ok, _, reason = strategy.entry_signal(
+        _snap(var_session_enabled=True, var_market_open=False, var_seconds_to_close=0), CFG)
+    assert not ok and reason == "var_market_closed"
+
+
+def test_entry_blocked_when_var_market_closing_soon():
+    cfg = {**CFG, "max_hold_hours": 2.0,
+           "variational": {"trading_hours": {"entry_margin": 1.2}}}
+    # 2h*1.2 = 2.4h lead required; only 1h to close -> blocked.
+    ok, _, reason = strategy.entry_signal(
+        _snap(var_session_enabled=True, var_market_open=True,
+              var_seconds_to_close=3600), cfg)
+    assert not ok and reason.startswith("var_market_closing_in_")
+
+
+def test_entry_allowed_when_open_with_ample_lead():
+    cfg = {**CFG, "max_hold_hours": 2.0,
+           "variational": {"trading_hours": {"entry_margin": 1.2}}}
+    ok, direction, _ = strategy.entry_signal(
+        _snap(var_session_enabled=True, var_market_open=True,
+              var_seconds_to_close=6 * 3600), cfg)
+    assert ok and direction == "short_var_long_lighter"
+
+
+def test_entry_session_gate_off_when_disabled():
+    # var_session_enabled falsy -> gate is a no-op regardless of the other fields.
+    ok, _, _ = strategy.entry_signal(
+        _snap(var_session_enabled=False, var_market_open=False), CFG)
+    assert ok
+
+
 def test_entry_blocked_when_basis_gain_below_floor():
     # review12: with require_entry_basis_gain, adverse/insufficient basis blocks.
     cfg = {**CFG, "require_entry_basis_gain": True, "min_entry_basis_gain_usdt": 1.0}

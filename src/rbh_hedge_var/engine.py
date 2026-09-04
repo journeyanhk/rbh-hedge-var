@@ -22,7 +22,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from . import economics, funding_attest, net_guard, reconcile, strategy, watchdog
+from . import economics, funding_attest, market_hours, net_guard, reconcile, strategy, watchdog
 from .config import env_int, read_env
 from .lighter_client import LighterReadOnlyClient
 from .live_executor import NakedLegError
@@ -60,6 +60,10 @@ class Engine:
         )
         self.var_symbol = vcfg.get("symbol", "XAU")
         self.lighter_symbol = lcfg.get("symbol", "XAU")   # P1-1: RHC market is XAU
+        # var-desgin6: TradFi trading-hours gate for the Variational leg (XAUS
+        # closes over the weekend). Config-driven UTC schedule; empty/disabled ->
+        # always tradable. Round-scoped market selection is Phase B.
+        self._var_hours = vcfg.get("trading_hours") or {}
         self.executor = ShadowExecutor(cfg)
         # Live execution wiring (Phase 2). Built only when live_trading is on;
         # constructing the gateways never disarms the guard or sends anything.
@@ -175,7 +179,21 @@ class Engine:
             "live_positions": ({k: str(v) for k, v in self._last_live_positions.items()}
                                if self._last_live_positions else None),
         })
+        # var-desgin6: trading-hours session state for the Variational leg.
+        sess = self._var_session()
+        snap.update({
+            "var_session_enabled": sess["enabled"],
+            "var_market_open": sess["open"],
+            "var_seconds_to_close": sess["seconds_to_close"],
+            "var_seconds_to_open": sess["seconds_to_open"],
+        })
         return snap
+
+    def _var_session(self) -> dict[str, Any]:
+        """Evaluate the Variational leg's trading-hours schedule at 'now' (UTC)."""
+        import datetime
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        return market_hours.evaluate(self._var_hours, now_utc)
 
     # ---- tick --------------------------------------------------------------
     def tick(self) -> dict[str, Any]:
@@ -317,6 +335,24 @@ class Engine:
             self._alert(f"⚠️ Watchdog {wd.action}: {wd.reason}")
             self._do_exit("watchdog_" + wd.action, snap)
             return f"watchdog_exit:{wd.action}"
+
+        # var-desgin6: HIGHEST-priority exit — flatten an XAUS round BEFORE the
+        # market closes, because a held leg freezes (RFQ stops filling) while the
+        # Lighter leg keeps moving. Fires only while still OPEN (so the close can
+        # actually fill); if we somehow reach a closed market while holding, the
+        # leg is already frozen — alert loudly, nothing to do but wait for reopen.
+        if snap.get("var_session_enabled"):
+            hours_cfg = (self.cfg.get("variational") or {}).get("trading_hours") or {}
+            close_buf = float(hours_cfg.get("close_buffer_seconds", 1800) or 1800)
+            to_close = snap.get("var_seconds_to_close")
+            if not snap.get("var_market_open"):
+                self._log("[SESSION] variational market CLOSED while holding — leg frozen until reopen")
+                self._alert("🛑 Variational market CLOSED with a round open — the leg is FROZEN "
+                            "until reopen; the Lighter leg is unhedged against gaps.")
+            elif to_close is not None and to_close < close_buf:
+                self._log(f"[SESSION] variational closes in {int(to_close)}s (<{int(close_buf)}s) -> force exit")
+                self._alert(f"⏰ Flattening round: XAUS closes in {int(to_close)//60}min.")
+                return self._do_exit("market_closing", snap)
 
         # Exit priority: basis/reversal -> take-profit -> per-round stop-loss.
         reversed_now = strategy.is_spread_reversed(snap, direction)

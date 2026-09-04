@@ -268,3 +268,26 @@ def test_recover_exiting_halts_when_guard_armed_despite_match(tmp_path):
     eng._recover(SM.EXITING)
     assert eng.sm.is_halted()
     assert eng.sm.mode == SM.EXITING
+
+
+# --- var-desgin6: trading-hours session gate (force-exit before market close) ---
+
+def test_hold_tick_force_exits_before_market_close(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng._do_entry("short_var_long_lighter", "t", _snap())   # shadow (guard armed)
+    assert eng.sm.mode == SM.HOLDING
+    snap = _snap(var_session_enabled=True, var_market_open=True,
+                 var_seconds_to_close=600)   # < close_buffer_seconds (1800)
+    action = eng._hold_tick(snap)
+    assert "market_closing" in action
+    assert eng.sm.mode == SM.COOLDOWN
+
+
+def test_hold_tick_no_force_exit_with_ample_time(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng._do_entry("short_var_long_lighter", "t", _snap())
+    snap = _snap(var_session_enabled=True, var_market_open=True,
+                 var_seconds_to_close=6 * 3600)
+    action = eng._hold_tick(snap)
+    assert action == "holding"
+    assert eng.sm.mode == SM.HOLDING

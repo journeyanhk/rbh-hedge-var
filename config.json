@@ -19,7 +19,17 @@
     "instrument_type": "perpetual_rwa_future",
     "//instrument_type": "FALLBACK ONLY — the gateway pulls instrument_type + funding_interval_s + asset_class from LIVE /api/metadata/supported_assets at quote time. XAUS (swap) almost certainly reports a DIFFERENT instrument_type than the XAU perp's 'perpetual_rwa_future'; do NOT trust this fallback for the swap. VERIFY with `probe-quote` before live — if XAUS 400s, paste the real response and pin the correct type here (var-desgin5 §3).",
     "asset_class": "commodity",
-    "//asset_class": "review16 probe-quote: the instrument body needs a `kind` = asset-class discriminator (valid set ETF/equity/index/commodity). XAU=commodity. Pulled from metadata.asset_class at quote time; this is the fallback."
+    "//asset_class": "review16 probe-quote: the instrument body needs a `kind` = asset-class discriminator (valid set ETF/equity/index/commodity). XAU=commodity. Pulled from metadata.asset_class at quote time; this is the fallback.",
+    "trading_hours": {
+      "//": "var-desgin6 Phase A: XAUS (gold spot swap) follows TradFi hours and CLOSES over the weekend. The engine REFUSES to open a Variational round when closed or too near a close, and FORCE-EXITS an open round `close_buffer_seconds` before a close (a held leg freezes while Lighter trades 24/7). Times are UTC; open_windows list weekly OPEN spans 'Day HH:MM'. VERIFY the real close time on the server against live metadata / the venue UI and adjust — these defaults are standard gold hours (Sun 22:05 UTC open, Fri 20:55 UTC weekend close). To trade around the clock (e.g. XAU perp) set enabled=false.",
+      "enabled": true,
+      "open_windows": [
+        {"open": "Sun 22:05", "close": "Fri 20:55"}
+      ],
+      "close_buffer_seconds": 1800,
+      "entry_margin": 1.2,
+      "//entry_margin": "refuse to OPEN when seconds_to_close < max_hold_hours*3600*entry_margin (or 90min if max_hold_hours=0). Override with entry_lead_seconds for an explicit lead."
+    }
   },
   "lighter": {
     "symbol": "XAU",

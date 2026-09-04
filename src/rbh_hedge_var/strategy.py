@@ -139,6 +139,23 @@ def entry_signal(snap: dict[str, Any], cfg: dict[str, Any]) -> tuple[bool, str, 
     """Return (should_enter, direction, reason)."""
     if snap.get("spread_hourly") is None:
         return False, "", "funding_unit_unknown:cannot_compute_spread"
+
+    # var-desgin6: TradFi trading-hours gate. Never OPEN a Variational round when
+    # its market (XAUS) is closed or so near a close that the round could not be
+    # flattened before the RFQ freezes. Only active when trading_hours.enabled.
+    if snap.get("var_session_enabled"):
+        if not snap.get("var_market_open"):
+            return False, "", "var_market_closed"
+        to_close = snap.get("var_seconds_to_close")
+        hours_cfg = (cfg.get("variational") or {}).get("trading_hours") or {}
+        lead = hours_cfg.get("entry_lead_seconds")
+        if lead is None:
+            max_hold_h = float(cfg.get("max_hold_hours", 0) or 0)
+            margin = float(hours_cfg.get("entry_margin", 1.2) or 1.2)
+            lead = max_hold_h * 3600 * margin if max_hold_h > 0 else 90 * 60
+        if to_close is not None and to_close < float(lead):
+            return False, "", f"var_market_closing_in_{int(to_close)}s"
+
     if str(snap.get("lighter_status")) not in ("active", "None", "none", ""):
         if snap.get("lighter_status") and snap["lighter_status"] != "active":
             return False, "", f"lighter_market_{snap['lighter_status']}"
