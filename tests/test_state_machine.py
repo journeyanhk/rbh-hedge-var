@@ -45,6 +45,23 @@ def test_full_lifecycle(tmp_path):
     assert sm.mode == IDLE
 
 
+def test_force_leave_cooldown(tmp_path):
+    sm = _sm(tmp_path)
+    sm.begin_entry("var_short_lit_long", "signal")
+    sm.confirm_hold([{"venue": "variational", "side": "sell", "qty": "2", "price": "4321"}])
+    sm.begin_exit("reversal")
+    sm.finish_exit(1.0, 0.0, "reversal", cooldown_s=100000)
+    assert sm.mode == COOLDOWN
+    # config change (future cooldowns) does not shorten this in-progress one:
+    assert sm.maybe_leave_cooldown() is False
+    # operator override ends it immediately.
+    assert sm.force_leave_cooldown() is True
+    assert sm.mode == IDLE
+    assert sm.state["cooldown_until"] is None
+    # idempotent: nothing to leave when already IDLE.
+    assert sm.force_leave_cooldown() is False
+
+
 def test_illegal_transition_raises(tmp_path):
     sm = _sm(tmp_path)
     try:

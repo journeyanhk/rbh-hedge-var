@@ -6,6 +6,7 @@ Commands:
   run          run the engine loop + monitor until interrupted
   guard-check  print net-guard status (proves writes are blocked)
   clear-halt   clear a latched drawdown HALT and reset PnL counters
+  clear-cooldown  end the current COOLDOWN now -> IDLE (skip the remaining wait)
   reconcile    (Phase 2) print real signed positions on both venues
   preflight    (Phase 2) go-live readiness table; never disarms/trades
   verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
@@ -84,6 +85,26 @@ def cmd_clear_halt(cfg) -> int:
         "message": "HALT cleared; realized_pnl and daily_pnl reset "
                    "(shadow_rounds.jsonl preserved). Restart or next tick resumes.",
         "prior": prior,
+    }, indent=2, default=str))
+    return 0
+
+
+def cmd_clear_cooldown(cfg) -> int:
+    from .state_machine import COOLDOWN, StateMachine
+    sm = StateMachine(cfg.get("state_file", "state.json"))
+    if sm.mode != COOLDOWN:
+        print(json.dumps({"cooldown": False, "mode": sm.mode,
+                          "message": "not in COOLDOWN; nothing to clear"}, indent=2))
+        return 0
+    until = sm.state.get("cooldown_until")
+    sm.force_leave_cooldown()
+    print(json.dumps({
+        "cooldown": False,
+        "cleared": True,
+        "mode": sm.mode,
+        "message": "COOLDOWN cleared -> IDLE; next tick may open a new round. "
+                   "Note: config close_cooldown_seconds only sets FUTURE cooldowns.",
+        "was_until": until,
     }, indent=2, default=str))
     return 0
 
@@ -319,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_guard_check(cfg)
     if command == "clear-halt":
         return cmd_clear_halt(cfg)
+    if command == "clear-cooldown":
+        return cmd_clear_cooldown(cfg)
     if command == "reconcile":
         return cmd_reconcile(cfg)
     if command == "preflight":

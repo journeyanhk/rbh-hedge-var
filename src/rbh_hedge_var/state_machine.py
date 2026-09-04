@@ -203,6 +203,21 @@ class StateMachine:
             return True
         return False
 
+    def force_leave_cooldown(self) -> bool:
+        """Operator override: end the current COOLDOWN immediately and go IDLE.
+
+        The per-round cooldown is written as an ABSOLUTE `cooldown_until`
+        timestamp at close time, so editing `close_cooldown_seconds` in config
+        only changes FUTURE closes — it never shortens an in-progress cooldown.
+        This is the supported way to skip the remaining wait. Returns True if a
+        cooldown was actually left, False if not currently in COOLDOWN."""
+        if self.mode != COOLDOWN:
+            return False
+        self.transition(IDLE, "cooldown_cleared_by_operator")
+        self.state["cooldown_until"] = None
+        self.save()
+        return True
+
     def bump_reversal(self, reversed_now: bool) -> int:
         streak = int(self.state.get("reversal_streak", 0))
         streak = streak + 1 if reversed_now else 0
