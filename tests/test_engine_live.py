@@ -194,3 +194,77 @@ def test_startup_no_halt_for_shadow_round(tmp_path):
     eng.sm.confirm_hold(_LEGS)  # shadow defaults True
     assert eng.halt_if_unmanageable_live_round(live=False) is None
     assert not eng.sm.is_halted()
+
+
+# --- var-fq1 Fix-1: preflight recognises its own persisted live position -----
+
+def _match_positions(eng):
+    # on-venue book == _LEGS (var sell 2.7 -> -2.7, lit buy 2.7 -> +2.7)
+    eng._var_gateway.pos = D("-2.7")
+    eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("2.7")}]}
+
+
+def test_preflight_resumes_persisted_live_round(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng.fetch_snapshot = lambda: _snap()
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(_LEGS)
+    eng.sm.state["shadow"] = False
+    eng.sm.save()
+    _match_positions(eng)
+    checks = {c["check"]: c for c in eng.preflight()}
+    assert checks["book_flat"]["ok"] is True
+    assert "resuming persisted live round" in checks["book_flat"]["detail"]
+
+
+def test_preflight_fails_on_orphan_residual(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng.fetch_snapshot = lambda: _snap()
+    # residual present but NO persisted live round (fresh IDLE state)
+    _match_positions(eng)
+    checks = {c["check"]: c for c in eng.preflight()}
+    assert checks["book_flat"]["ok"] is False
+    assert "unexpected residual" in checks["book_flat"]["detail"]
+
+
+# --- var-fq1 Fix-2: EXITING recovery resumes the close on a matching residual -
+
+def _exiting_live_round(eng):
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng.fetch_snapshot = lambda: _snap()
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(_LEGS)
+    eng.sm.state["shadow"] = False
+    eng.sm.begin_exit("mid")
+    assert eng.sm.mode == SM.EXITING
+
+
+def test_recover_exiting_resumes_close_on_match(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    _exiting_live_round(eng)
+    _match_positions(eng)
+    eng._recover(SM.EXITING)
+    assert eng.sm.mode == SM.COOLDOWN, "resume-close should finish the round"
+    assert not eng.sm.is_halted()
+
+
+def test_recover_exiting_halts_on_position_mismatch(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    _exiting_live_round(eng)
+    # variational leg present but Lighter leg missing -> mismatch (possible orphan)
+    eng._var_gateway.pos = D("-2.7")
+    eng.lighter.account_snapshot = lambda: {"positions": []}
+    eng._recover(SM.EXITING)
+    assert eng.sm.is_halted()
+    assert "recovery_residual_position" in (eng.sm.halt_reason() or "")
+
+
+def test_recover_exiting_halts_when_guard_armed_despite_match(tmp_path):
+    # even a matching residual must NOT be traded while the guard is armed
+    eng = _engine(tmp_path, live=True)
+    _exiting_live_round(eng)
+    net_guard.arm()  # re-lock: cannot trade
+    _match_positions(eng)
+    eng._recover(SM.EXITING)
+    assert eng.sm.is_halted()
+    assert eng.sm.mode == SM.EXITING

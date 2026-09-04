@@ -547,8 +547,37 @@ class Engine:
                 self.sm.finish_exit(0.0, self.sm.funding_accrued(), "recovered_exit_flat",
                                     int(self.cfg.get("close_cooldown_seconds", 1200)))
             return
-        # Any residual position after a crash is a possible naked leg. Refuse to
-        # trade; latch HALT and let a human flatten and reconcile the book.
+
+        # review16 incident Fix-2: a residual that MATCHES our ledger legs is NOT
+        # an orphan — it is the hedge we were mid-closing. If we can actually
+        # trade (guard disarmed via the Fix-1 resume-arm), RESUME the close rather
+        # than HALT, so a restart-while-exiting self-heals. Restricted to EXITING
+        # WITH recorded legs: ENTERING has no legs yet (written at confirm_hold),
+        # so positions_balanced([]) would be vacuously true — we must NOT guess
+        # there, HALT stays the safe answer. Guard-armed also falls through to
+        # HALT (cannot trade -> the Fix-1/Fix-3 path already surfaced it).
+        legs = self.sm.state.get("legs") or []
+        if (mode == EXITING and legs
+                and reconcile.positions_balanced(legs, live, tolerance=tol)
+                and not net_guard.is_armed()):
+            self._log(f"[RECOVERY] live EXITING residual matches ledger {residual} "
+                      f"-> resuming close (guard disarmed)")
+            try:
+                snap = self.fetch_snapshot()
+            except Exception:
+                snap = self.last_snapshot or {}
+            try:
+                self._close_and_finish("recovered_exit_resume", snap)
+            except Exception as exc:
+                r = f"recovery_resume_close_failed:{type(exc).__name__}"
+                if self.sm.set_halt(r):
+                    self._log(f"[RECOVERY HALT] EXITING resume-close raised {exc}")
+                    self._alert(f"🛑 HALT: EXITING resume-close failed: {exc}. Verify both "
+                                f"venues, flatten any residual, then `clear-halt`.")
+            return
+
+        # Any OTHER residual (orphan / qty mismatch / cannot trade) is a possible
+        # naked leg. Refuse to trade; latch HALT and let a human reconcile.
         reason = f"recovery_residual_position:{mode}"
         if self.sm.set_halt(reason):
             self._log(f"[RECOVERY HALT] residual positions on {mode} boot: {residual}")
@@ -784,14 +813,30 @@ class Engine:
         except Exception as exc:
             add("funding_unit_verified", False, f"snapshot failed: {exc}")
 
-        # Book flat (no residual position on either venue) — safe cold start.
+        # Book flat OR a resumable persisted LIVE round (review16 incident Fix-1).
+        # book_flat is a COLD-START gate; applying it verbatim to a restart WHILE
+        # holding made a live round un-re-armable forever (positions != 0 -> FAIL
+        # -> stay shadow -> guard armed -> cannot close -> HALT on next exit).
+        # Recognise OUR OWN persisted position (on-venue book matches the ledger
+        # legs within half a size step) as a legitimate RESUME, so re-arming works
+        # and the engine keeps managing/closing it. A true orphan residual (no
+        # matching persisted round, or mismatched qty) still FAILs.
         if self._var_gateway is not None:
             try:
                 live = reconcile.reconcile_positions(
                     self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
                 # P1-3: "flat" is within half a size step, not an arbitrary 1e-7.
-                flat = all(abs(D(v)) <= self._size_step() / 2 for v in live.values())
-                add("book_flat", flat, f"positions={ {k: str(v) for k, v in live.items()} }")
+                half = self._size_step() / 2
+                pos = f"positions={ {k: str(v) for k, v in live.items()} }"
+                legs = self.sm.state.get("legs") or []
+                persisted_live = (not bool(self.sm.state.get("shadow", True))
+                                  and self.sm.mode in (HOLDING, EXITING) and bool(legs))
+                if all(abs(D(v)) <= half for v in live.values()):
+                    add("book_flat", True, pos)
+                elif persisted_live and reconcile.positions_balanced(legs, live, tolerance=half):
+                    add("book_flat", True, f"resuming persisted live round ({pos})")
+                else:
+                    add("book_flat", False, f"unexpected residual: {pos}")
             except Exception as exc:
                 add("book_flat", False, f"reconcile failed: {exc}")
         else:

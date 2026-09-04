@@ -124,13 +124,26 @@ def _maybe_arm_live(cfg, eng) -> bool:
     if not cfg.get("live_trading"):
         return False
     if os.environ.get("RBH_HEDGE_LIVE_ARM") != LIVE_ARM_TOKEN:
-        print("[run] live_trading=true but RBH_HEDGE_LIVE_ARM not set -> staying SHADOW.", flush=True)
+        msg = "live_trading=true but RBH_HEDGE_LIVE_ARM not set -> staying SHADOW."
+        print(f"[run] {msg}", flush=True)
+        try:
+            eng.tg.send(f"⚠️ {msg}")
+        except Exception:
+            pass
         return False
     checks = eng.preflight()
     gate = [c for c in checks if c["check"] != "write_guard_armed"]
     if not all(c["ok"] for c in gate):
         failed = [c["check"] for c in gate if not c["ok"]]
-        print(f"[run] preflight FAILED {failed} -> staying SHADOW.", flush=True)
+        # review16 incident Fix-3: this downgrade is exactly how a live round can
+        # end up running under an armed guard. It must be LOUD (TG), not just a
+        # console line, so the operator sees it even without tailing journald.
+        msg = f"preflight FAILED {failed} -> staying SHADOW (write-guard armed)."
+        print(f"[run] {msg}", flush=True)
+        try:
+            eng.tg.send(f"⚠️ {msg}")
+        except Exception:
+            pass
         return False
     net_guard.disarm(LIVE_ARM_TOKEN)
     print("[run] 🔴 WRITE-GUARD DISARMED — LIVE ORDERS ENABLED.", flush=True)
