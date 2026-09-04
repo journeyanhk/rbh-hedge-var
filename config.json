@@ -28,7 +28,10 @@
       ],
       "close_buffer_seconds": 1800,
       "entry_margin": 1.2,
-      "//entry_margin": "refuse to OPEN when seconds_to_close < max_hold_hours*3600*entry_margin (or 90min if max_hold_hours=0). Override with entry_lead_seconds for an explicit lead."
+      "//entry_margin": "refuse to OPEN when seconds_to_close < max_hold_hours*3600*entry_margin (or 90min if max_hold_hours=0). Override with entry_lead_seconds for an explicit lead.",
+      "frozen_alert_interval_s": 21600,
+      "//frozen_alert_interval_s": "review17 P1-1: if a round is somehow still held when the market closes (leg frozen), alert ONCE then heartbeat this often (default 6h) instead of one TG per tick; a 'reopened' note clears the latch.",
+      "//metadata_overlay": "review17 P1-2: the engine reads live venue metadata each tick and, if it exposes a next-close timestamp EARLIER than this calendar (holiday early-close e.g. 2026-09-07 Labor Day 18:30 UTC, or a DST shift), force-exits at the earlier one and TG-alerts the divergence so you can update open_windows. Metadata missing/unparsable -> pure calendar. Daily maintenance breaks (if any) should be added here as separate windows once verified on the server."
     }
   },
   "lighter": {

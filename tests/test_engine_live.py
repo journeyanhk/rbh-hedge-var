@@ -291,3 +291,72 @@ def test_hold_tick_no_force_exit_with_ample_time(tmp_path):
     action = eng._hold_tick(snap)
     assert action == "holding"
     assert eng.sm.mode == SM.HOLDING
+
+
+# --- review17: frozen-market alert latch (P1-1) + metadata overlay (P1-2) ---
+
+def _capture_alerts(eng):
+    sent = []
+    eng._alert = lambda text: sent.append(text)
+    return sent
+
+
+def test_frozen_market_alerts_once_not_every_tick(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng._do_entry("short_var_long_lighter", "t", _snap())
+    sent = _capture_alerts(eng)
+    closed = _snap(var_session_enabled=True, var_market_open=False, var_seconds_to_close=0)
+    # three consecutive frozen ticks -> exactly one alert (heartbeat not yet due)
+    for _ in range(3):
+        assert eng._hold_tick(closed) == "session_frozen"
+    assert len(sent) == 1
+    assert "FROZEN" in sent[0]
+    assert eng.sm.mode == SM.HOLDING  # cannot exit a frozen leg
+
+
+def test_frozen_market_heartbeat_after_interval(tmp_path):
+    import time
+    eng = _engine(tmp_path, live=True)
+    eng.cfg["variational"]["trading_hours"]["frozen_alert_interval_s"] = 3600
+    eng._do_entry("short_var_long_lighter", "t", _snap())
+    sent = _capture_alerts(eng)
+    closed = _snap(var_session_enabled=True, var_market_open=False, var_seconds_to_close=0)
+    eng._hold_tick(closed)              # first alert, latch = now
+    assert len(sent) == 1
+    # push the latch beyond the heartbeat interval -> next frozen tick heartbeats
+    eng.sm.state["session_frozen_alerted_at"] = int(time.time()) - 4000
+    eng._hold_tick(closed)
+    assert len(sent) == 2  # first + heartbeat
+
+
+def test_frozen_latch_cleared_on_reopen(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng._do_entry("short_var_long_lighter", "t", _snap())
+    sent = _capture_alerts(eng)
+    eng._hold_tick(_snap(var_session_enabled=True, var_market_open=False, var_seconds_to_close=0))
+    assert eng.sm.state.get("session_frozen_alerted_at") is not None
+    # reopen with ample time -> latch cleared + one reopen note, round continues
+    action = eng._hold_tick(_snap(var_session_enabled=True, var_market_open=True,
+                                  var_seconds_to_close=6 * 3600))
+    assert action == "holding"
+    assert eng.sm.state.get("session_frozen_alerted_at") is None
+    assert any("REOPENED" in m for m in sent)
+
+
+def test_metadata_overlay_forces_earlier_close(tmp_path):
+    # calendar says open with plenty of time, but venue metadata says close in
+    # 10min (holiday early-close) -> overlay must flatten now.
+    import datetime
+    eng = _engine(tmp_path, live=True)
+    # Two windows covering the entire week so the CALENDAR is always open,
+    # isolating the metadata overlay from wall-clock flakiness.
+    eng._var_hours = {"enabled": True, "open_windows": [
+        {"open": "Mon 00:00", "close": "Thu 00:00"},
+        {"open": "Thu 00:00", "close": "Mon 00:00"},
+    ]}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    var_asset = {"raw": {"next_close_at": int(now.timestamp()) + 600}}  # 10min < 1800 buffer
+    sess = eng._var_session(var_asset)
+    assert sess["open"] is True
+    assert sess["seconds_to_close"] <= 600
+    assert sess.get("seconds_to_close_source") == "metadata"

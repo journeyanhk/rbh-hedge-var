@@ -19,6 +19,7 @@ earlier in the week than open). The market is OPEN iff now falls in any window.
 """
 from __future__ import annotations
 
+import datetime as _dt
 from typing import Any
 
 MINUTES_PER_WEEK = 7 * 24 * 60
@@ -109,3 +110,84 @@ def evaluate(cfg_hours: dict[str, Any] | None, now_utc) -> dict[str, Any]:
     to_open = min(to_open_candidates) if to_open_candidates else None
     return {"enabled": True, "open": False, "seconds_to_close": 0,
             "seconds_to_open": int(to_open) * 60 if to_open is not None else None}
+
+
+# --- review17 P1-2: live-metadata conservative overlay ---------------------
+#
+# The static config calendar is our source of truth for the *shape* of the
+# week, but it cannot know about holiday early-closes (e.g. US Labor Day
+# 2026-09-07 closing 18:30 UTC instead of 21:00) or DST shifts (gold hours
+# anchor to New York time, so the UTC close point moves ±1h in Mar/Nov). The
+# venue metadata row DOES carry the real next-close timestamp; we parse it
+# best-effort and let the caller take the EARLIER of the two closes. Any
+# unrecognized/absent/unparsable shape returns None so the caller falls back
+# to the pure calendar — a single-source failure never breaks the tick.
+
+_META_CLOSE_PATHS = (
+    ("trading_schedule", "next_close_at"),
+    ("trading_schedule", "next_close"),
+    ("trading_schedule", "close_at"),
+    ("schedule", "next_close_at"),
+    ("session", "next_close_at"),
+    ("next_close_at",),
+    ("next_close",),
+    ("session_close_at",),
+    ("close_at",),
+)
+
+
+def _dig(row: dict[str, Any], path: tuple[str, ...]):
+    cur: Any = row
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+        if cur is None:
+            return None
+    return cur
+
+
+def _to_unix(val: Any) -> float | None:
+    """Coerce an epoch number (s or ms) or ISO-8601 string to unix seconds."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        v = float(val)
+        return v / 1000.0 if v > 1e12 else v
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            v = float(s)
+            return v / 1000.0 if v > 1e12 else v
+        except ValueError:
+            pass
+        try:
+            dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return dt.timestamp()
+    return None
+
+
+def next_close_from_metadata(raw: Any, now_utc) -> int | None:
+    """Best-effort seconds-to-next-close from a venue metadata row.
+
+    Returns a non-negative int, or None when no recognizable next-close field
+    is present. Never raises — an unexpected shape simply yields None.
+    """
+    if not isinstance(raw, dict):
+        return None
+    now_unix = now_utc.timestamp()
+    for path in _META_CLOSE_PATHS:
+        val = _dig(raw, path)
+        if val is None:
+            continue
+        unix = _to_unix(val)
+        if unix is None:
+            continue
+        return int(max(0, unix - now_unix))
+    return None

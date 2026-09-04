@@ -50,3 +50,43 @@ def test_multiple_windows_union_with_daily_break():
     assert inside["open"] is True
     in_break = market_hours.evaluate(hours, datetime.datetime(2026, 9, 7, 21, 30))
     assert in_break["open"] is False
+
+
+# --- review17 P1-2: live-metadata conservative overlay parser ---------------
+
+def _now():
+    return datetime.datetime(2026, 9, 4, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_metadata_close_epoch_seconds():
+    now = _now()
+    close = int(now.timestamp()) + 3600
+    r = market_hours.next_close_from_metadata({"next_close_at": close}, now)
+    assert r == 3600
+
+
+def test_metadata_close_epoch_millis():
+    now = _now()
+    close_ms = (int(now.timestamp()) + 1800) * 1000
+    r = market_hours.next_close_from_metadata({"next_close_at": close_ms}, now)
+    assert r == 1800
+
+
+def test_metadata_close_iso_string_nested():
+    now = _now()
+    r = market_hours.next_close_from_metadata(
+        {"trading_schedule": {"next_close_at": "2026-09-04T13:00:00Z"}}, now)
+    assert r == 3600
+
+
+def test_metadata_close_absent_returns_none():
+    assert market_hours.next_close_from_metadata({"unrelated": 1}, _now()) is None
+    assert market_hours.next_close_from_metadata(None, _now()) is None
+    assert market_hours.next_close_from_metadata({"next_close_at": "garbage"}, _now()) is None
+
+
+def test_metadata_close_in_past_clamps_to_zero():
+    now = _now()
+    r = market_hours.next_close_from_metadata(
+        {"next_close_at": int(now.timestamp()) - 500}, now)
+    assert r == 0

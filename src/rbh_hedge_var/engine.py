@@ -64,6 +64,9 @@ class Engine:
         # closes over the weekend). Config-driven UTC schedule; empty/disabled ->
         # always tradable. Round-scoped market selection is Phase B.
         self._var_hours = vcfg.get("trading_hours") or {}
+        # review17 P1-2: in-memory latch so a persistent config/metadata close
+        # divergence only alerts once (re-armed when the divergence clears).
+        self._sched_divergence_alerted = False
         self.executor = ShadowExecutor(cfg)
         # Live execution wiring (Phase 2). Built only when live_trading is on;
         # constructing the gateways never disarms the guard or sends anything.
@@ -180,7 +183,7 @@ class Engine:
                                if self._last_live_positions else None),
         })
         # var-desgin6: trading-hours session state for the Variational leg.
-        sess = self._var_session()
+        sess = self._var_session(var_asset)
         snap.update({
             "var_session_enabled": sess["enabled"],
             "var_market_open": sess["open"],
@@ -189,11 +192,65 @@ class Engine:
         })
         return snap
 
-    def _var_session(self) -> dict[str, Any]:
-        """Evaluate the Variational leg's trading-hours schedule at 'now' (UTC)."""
+    def _var_session(self, var_asset: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Evaluate the Variational leg's trading-hours schedule at 'now' (UTC).
+
+        review17 P1-2: layer the live venue metadata on top of the static config
+        calendar as a MORE-conservative overlay — if the metadata exposes a
+        next-close timestamp earlier than the calendar's (a holiday early close,
+        a DST shift, an ad-hoc halt), honor the earlier one. Metadata absent or
+        unparsable -> pure calendar (single-source failure is non-fatal).
+        """
         import datetime
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-        return market_hours.evaluate(self._var_hours, now_utc)
+        sess = market_hours.evaluate(self._var_hours, now_utc)
+        if not sess.get("enabled"):
+            return sess
+        raw = (var_asset or {}).get("raw") or {}
+        meta_to_close = market_hours.next_close_from_metadata(raw, now_utc)
+        if meta_to_close is None:
+            return sess
+        cal = sess.get("seconds_to_close")
+        if sess.get("open") and (cal is None or meta_to_close < cal):
+            if cal is not None and abs(cal - meta_to_close) > 600 and not self._sched_divergence_alerted:
+                self._log(f"[SESSION] schedule divergence: calendar close in {cal}s, metadata "
+                          f"close in {meta_to_close}s -> using metadata; update config open_windows")
+                self._alert(f"📅 XAUS schedule drift: config says close in {int(cal)//60}min but venue "
+                            f"metadata says {int(meta_to_close)//60}min. Using the earlier; update open_windows.")
+                self._sched_divergence_alerted = True
+            sess = {**sess, "seconds_to_close": int(meta_to_close), "seconds_to_close_source": "metadata"}
+            if meta_to_close <= 0:
+                sess["open"] = False
+        else:
+            self._sched_divergence_alerted = False
+        return sess
+
+    def _alert_market_frozen(self, hours_cfg: dict[str, Any]) -> None:
+        """P1-1: alert-with-latch when the market is closed while we hold. The
+        leg is frozen for the whole close (~49h over a weekend), so we emit one
+        first alert then a heartbeat every ``frozen_alert_interval_s`` rather
+        than one TG per tick. The latch persists in state so a restart mid-close
+        does not re-spam."""
+        now = int(time.time())
+        heartbeat = int(hours_cfg.get("frozen_alert_interval_s", 21600) or 21600)
+        last = self.sm.state.get("session_frozen_alerted_at")
+        if last is None:
+            self._log("[SESSION] variational market CLOSED while holding — leg frozen until reopen")
+            self._alert("🛑 Variational market CLOSED with a round open — the leg is FROZEN "
+                        "until reopen; the Lighter leg is unhedged against gaps.")
+            self.sm.state["session_frozen_alerted_at"] = now
+        elif now - int(last) >= heartbeat:
+            mins = (now - int(last)) // 60
+            self._log(f"[SESSION] variational still CLOSED after ~{mins}min — leg still frozen")
+            self._alert("🛑 Variational still CLOSED — round still frozen; Lighter leg still unhedged.")
+            self.sm.state["session_frozen_alerted_at"] = now
+
+    def _clear_frozen_latch(self) -> None:
+        """Clear the frozen-alert latch on reopen, emitting a single note."""
+        if self.sm.state.get("session_frozen_alerted_at") is not None:
+            self._log("[SESSION] variational REOPENED — leg unfrozen, resuming normal exit logic")
+            self._alert("✅ Variational REOPENED — the frozen round can trade again.")
+            self.sm.state["session_frozen_alerted_at"] = None
 
     # ---- tick --------------------------------------------------------------
     def tick(self) -> dict[str, Any]:
@@ -346,10 +403,17 @@ class Engine:
             close_buf = float(hours_cfg.get("close_buffer_seconds", 1800) or 1800)
             to_close = snap.get("var_seconds_to_close")
             if not snap.get("var_market_open"):
-                self._log("[SESSION] variational market CLOSED while holding — leg frozen until reopen")
-                self._alert("🛑 Variational market CLOSED with a round open — the leg is FROZEN "
-                            "until reopen; the Lighter leg is unhedged against gaps.")
-            elif to_close is not None and to_close < close_buf:
+                # Leg is FROZEN: the RFQ will not fill, so we cannot exit — wait
+                # for reopen. P1-1 (review17): latch the alert so a ~49h weekend
+                # freeze does not emit one TG per tick; first alert + a heartbeat
+                # every frozen_alert_interval_s, cleared (with a reopen note) once
+                # the market comes back.
+                self._alert_market_frozen(hours_cfg)
+                return "session_frozen"
+            # Market is OPEN: clear any frozen latch (one "reopened" note), then
+            # flatten if we are inside the pre-close buffer.
+            self._clear_frozen_latch()
+            if to_close is not None and to_close < close_buf:
                 self._log(f"[SESSION] variational closes in {int(to_close)}s (<{int(close_buf)}s) -> force exit")
                 self._alert(f"⏰ Flattening round: XAUS closes in {int(to_close)//60}min.")
                 return self._do_exit("market_closing", snap)
