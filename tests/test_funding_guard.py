@@ -41,6 +41,29 @@ def test_verify_units_mismatch_blocks_live():
     assert res.status == "mismatch" and not res.live_allowed
 
 
+def test_verify_units_swap_var_leg_verified_despite_no_interval():
+    # var-desgin5: XAUS swap publishes no interval (None) — with var_is_swap it is
+    # EXEMPT from the interval gate and the pair verifies for live.
+    res = fg.verify_units(None, 3600, expected_var_s=0, expected_lighter_s=3600,
+                          var_is_swap=True)
+    assert res.verified and res.live_allowed
+    assert "swap" in res.reason
+
+
+def test_verify_units_swap_var_leg_ignores_zero_interval():
+    res = fg.verify_units(0, 3600, expected_var_s=0, expected_lighter_s=3600,
+                          var_is_swap=True)
+    assert res.verified and res.live_allowed
+
+
+def test_verify_units_non_swap_lighter_still_gated_when_swap_var():
+    # Swapping the var leg must NOT relax the lighter interval requirement.
+    res = fg.verify_units(None, None, expected_var_s=0, expected_lighter_s=3600,
+                          var_is_swap=True)
+    assert res.status == "unverified" and not res.live_allowed
+    assert "lighter" in res.reason
+
+
 def test_unit_hint_conflicts_ignores_zero_rate():
     # review12: a zero funding rate carries no unit info; the magnitude heuristic
     # would wrongly say "per_interval" and warn on an 'annualized' venue.

@@ -104,23 +104,33 @@ def verify_units(
     expected_var_s: int,
     expected_lighter_s: int,
     lighter_attested_interval_s: int | None = None,
+    var_is_swap: bool = False,
+    lighter_is_swap: bool = False,
 ) -> FundingUnitResult:
+    # A SWAP leg (Variational's XAUS "Swap on Gold Spot") carries NO funding:
+    # funding_rate = 0 and funding_interval_s = 0/absent by design. Its unit is
+    # therefore trivially KNOWN (a permanent zero), so it is EXEMPT from the
+    # interval-present / non-positive / mismatch checks that exist to prove a
+    # PERP's settlement cadence. The operator declares a leg swap via config
+    # (funding_unit="none" / expected_interval=0); we never infer it from a
+    # momentarily-zero published rate.
     # review4 P0-D: RHC Lighter never publishes an interval, which would weld the
     # live gate shut. A valid private funding attestation (proven cadence from
     # real settlements, see funding_attest) may supply the interval in its place.
     attested_used = False
-    if lighter_interval_s is None and lighter_attested_interval_s:
+    if (not lighter_is_swap and lighter_interval_s is None
+            and lighter_attested_interval_s):
         try:
             lighter_interval_s = int(lighter_attested_interval_s)
             attested_used = True
         except (TypeError, ValueError):
             lighter_interval_s = None
-    if var_interval_s is None or lighter_interval_s is None:
-        missing = []
-        if var_interval_s is None:
-            missing.append("variational")
-        if lighter_interval_s is None:
-            missing.append("lighter")
+    missing = []
+    if not var_is_swap and var_interval_s is None:
+        missing.append("variational")
+    if not lighter_is_swap and lighter_interval_s is None:
+        missing.append("lighter")
+    if missing:
         return FundingUnitResult(
             status="unverified",
             reason=f"funding_interval_s missing for: {', '.join(missing)}",
@@ -128,7 +138,8 @@ def verify_units(
             lighter_interval_s=lighter_interval_s,
             live_allowed=False,
         )
-    if var_interval_s <= 0 or lighter_interval_s <= 0:
+    if ((not var_is_swap and var_interval_s <= 0)
+            or (not lighter_is_swap and lighter_interval_s <= 0)):
         return FundingUnitResult(
             status="unverified",
             reason="non-positive funding interval",
@@ -137,9 +148,9 @@ def verify_units(
             live_allowed=False,
         )
     mismatches = []
-    if int(var_interval_s) != int(expected_var_s):
+    if not var_is_swap and int(var_interval_s) != int(expected_var_s):
         mismatches.append(f"variational {var_interval_s}s != expected {expected_var_s}s")
-    if int(lighter_interval_s) != int(expected_lighter_s):
+    if not lighter_is_swap and int(lighter_interval_s) != int(expected_lighter_s):
         mismatches.append(f"lighter {lighter_interval_s}s != expected {expected_lighter_s}s")
     if mismatches:
         return FundingUnitResult(
@@ -149,11 +160,19 @@ def verify_units(
             lighter_interval_s=lighter_interval_s,
             live_allowed=False,
         )
+    notes = []
+    if var_is_swap:
+        notes.append("variational swap (zero funding)")
+    if lighter_is_swap:
+        notes.append("lighter swap (zero funding)")
+    if attested_used:
+        notes.append("lighter via funding attestation")
+    reason = "both funding units known"
+    if notes:
+        reason += " (" + "; ".join(notes) + ")"
     return FundingUnitResult(
         status="verified",
-        reason=("both intervals match config"
-                + (" (lighter via funding attestation)" if attested_used else
-                   "; both intervals published")),
+        reason=reason,
         var_interval_s=var_interval_s,
         lighter_interval_s=lighter_interval_s,
         live_allowed=True,

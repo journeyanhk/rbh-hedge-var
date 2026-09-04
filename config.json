@@ -7,15 +7,17 @@
 
   "symbol": "XAU",
   "variational": {
-    "symbol": "XAU",
+    "symbol": "XAUS",
+    "//symbol": "var-desgin5: switched the Variational leg from XAU (perp) to XAUS ('Swap on Gold Spot'). Swap = ZERO funding (rate=0, funding_interval_s=0), ~half the base spread of the perp, deeper book, 2x points. The Lighter leg stays XAU. reconcile now reads each venue with its own symbol.",
     "base_url": "https://omni.variational.io",
     "token_env_file": ".env",
-    "funding_unit": "annualized",
+    "funding_unit": "none",
+    "//funding_unit_leg": "var-desgin5: 'none' marks this leg a zero-funding SWAP. It makes the funding-unit gate EXEMPT this leg (a swap has no settlement cadence to prove) and forces its hourly funding contribution to 0, so the spread signal = -lighter_funding. Paired with expected_variational_funding_interval_s=0.",
     "//phase2_auth": "Order gateway uses the token scheme: a browser-session token (VARIATIONAL_TOKEN) sent as the vr-token COOKIE (verified in vo — NOT Authorization: Bearer, which returns 'No token'). Endpoint paths are the review4 defaults (/api/quotes/indicative, /api/orders/new/market, /api/positions, /api/portfolio) — do NOT re-pin a `paths` override unless the real API moves. Variational's official Trading API is not yet public, so token+frontend endpoints are the only working route. NOTE: vr-token is a session cookie that expires — refresh from browser DevTools (Application -> Cookies -> vr-token) when reconcile 401s.",
     "auth_scheme": "token",
     "impersonate": true,
     "instrument_type": "perpetual_rwa_future",
-    "//instrument_type": "review16: XAU is a perpetual_rwa_future (from live /api/metadata/supported_assets), NOT a plain perpetual_future — sending the wrong type built an unlisted contract string 'P-XAU-USDC-14400' and 400'd. The gateway now pulls instrument_type + funding_interval_s from live metadata at quote time; this is only the fallback when that fetch is unavailable.",
+    "//instrument_type": "FALLBACK ONLY — the gateway pulls instrument_type + funding_interval_s + asset_class from LIVE /api/metadata/supported_assets at quote time. XAUS (swap) almost certainly reports a DIFFERENT instrument_type than the XAU perp's 'perpetual_rwa_future'; do NOT trust this fallback for the swap. VERIFY with `probe-quote` before live — if XAUS 400s, paste the real response and pin the correct type here (var-desgin5 §3).",
     "asset_class": "commodity",
     "//asset_class": "review16 probe-quote: the instrument body needs a `kind` = asset-class discriminator (valid set ETF/equity/index/commodity). XAU=commodity. Pulled from metadata.asset_class at quote time; this is the fallback."
   },
@@ -39,7 +41,8 @@
   "leverage": 10,
 
   "//funding_guard": "Hard gate: both legs must publish a positive funding_interval_s. Verified live: Variational settles 4h (14400s, annualized rate); RHC Lighter is hourly but does NOT publish the interval field, so it stays UNVERIFIED until private settlement confirms it in Phase 2.",
-  "expected_variational_funding_interval_s": 14400,
+  "expected_variational_funding_interval_s": 0,
+  "//expected_variational_funding_interval_s": "var-desgin5: 0 = SWAP (XAUS has no funding). This EXEMPTS the Variational leg from the funding-interval gate. Set back to 14400 only if reverting to the XAU perp.",
   "expected_lighter_funding_interval_s": 3600,
   "require_funding_unit_verified_for_live": true,
 

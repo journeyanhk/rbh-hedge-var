@@ -48,6 +48,30 @@ def test_lighter_rate_without_basis_defaults_to_settlement_interval():
     assert snap["lighter_funding_hourly"] == Decimal("0.000032")
 
 
+def test_swap_var_leg_zero_funding_verified_and_spread_is_lighter():
+    # var-desgin5: XAUS swap leg — no funding published (None), config declares it
+    # a swap. The pair must VERIFY, var funding contributes 0, and the spread is
+    # exactly the negated lighter hourly rate.
+    var_asset = {"symbol": "XAUS", "price": "4466", "funding_rate": "0",
+                 "funding_interval_s": None}
+    lit_contract = {"symbol": "XAU", "mark_price": "4470", "status": "active"}
+    lit_funding = {"rate": "0.000032", "funding_interval_s": None,
+                   "official_interval_s": 3600}
+    cfg = {
+        "expected_variational_funding_interval_s": 0,
+        "expected_lighter_funding_interval_s": 3600,
+        "variational": {"funding_unit": "none"},
+        "lighter": {"funding_unit": "per_interval", "funding_rate_basis_s": 28800},
+        "_attested_lighter_interval_s": 3600,
+    }
+    snap = strategy.market_snapshot(var_asset, lit_contract, lit_funding, cfg)
+    assert snap["var_is_swap"] is True
+    assert snap["funding_verified"] is True and snap["live_allowed_by_units"] is True
+    assert snap["var_funding_hourly"] == Decimal("0")
+    assert snap["lighter_funding_hourly"] == Decimal("0.000004")
+    assert snap["spread_hourly"] == Decimal("-0.000004")
+
+
 def _snap(**kw):
     base = {
         "spread_hourly": Decimal("0.0001"),

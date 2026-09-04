@@ -24,6 +24,19 @@ from . import funding_guard
 from .numeric import ZERO, D
 
 
+def _is_swap_leg(leg_cfg: dict[str, Any] | None, expected_interval_s: Any) -> bool:
+    """A leg is a zero-funding SWAP when the operator declares it so: either
+    funding_unit == "none" or the expected funding interval is 0. Never inferred
+    from a momentarily-zero published rate (that carries no unit information)."""
+    unit = str((leg_cfg or {}).get("funding_unit") or "").strip().lower()
+    if unit == "none":
+        return True
+    try:
+        return int(expected_interval_s) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
                     lighter_funding: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     px_var = D(var_asset.get("price"))
@@ -33,6 +46,16 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
     var_int = var_asset.get("funding_interval_s")            # published, may be None
     lit_int = lighter_funding.get("funding_interval_s")      # published, may be None
 
+    # SWAP detection (var-desgin5): a Variational "Swap" market (e.g. XAUS) has
+    # NO funding — rate=0, interval=0/absent. The operator declares it via config
+    # (funding_unit="none" or expected_interval=0), NOT from a momentarily-zero
+    # published rate. A swap leg contributes 0 to the funding spread and is exempt
+    # from the interval gate.
+    var_is_swap = _is_swap_leg(cfg.get("variational"),
+                               cfg.get("expected_variational_funding_interval_s"))
+    lit_is_swap = _is_swap_leg(cfg.get("lighter"),
+                               cfg.get("expected_lighter_funding_interval_s"))
+
     # Live gate uses ONLY published intervals -> fails closed when unknown.
     # review4 P0-D: a valid private funding attestation may stand in for the
     # interval Lighter never publishes (engine injects it as a private cfg key).
@@ -41,6 +64,8 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
         expected_var_s=int(cfg.get("expected_variational_funding_interval_s", 3600)),
         expected_lighter_s=int(cfg.get("expected_lighter_funding_interval_s", 3600)),
         lighter_attested_interval_s=cfg.get("_attested_lighter_interval_s"),
+        var_is_swap=var_is_swap,
+        lighter_is_swap=lit_is_swap,
     )
 
     # Economics/display use a REFERENCE interval so the dashboard still shows
@@ -61,12 +86,14 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
     # override only matters for Lighter; default to the reference interval.
     var_basis = int((cfg.get("variational") or {}).get("funding_rate_basis_s") or var_ref)
     lit_basis = int((cfg.get("lighter") or {}).get("funding_rate_basis_s") or lit_ref)
-    var_hourly = funding_guard.normalize_hourly(var_asset.get("funding_rate"), var_basis, var_unit)
-    lit_hourly = funding_guard.normalize_hourly(lighter_funding.get("rate"), lit_basis, lit_unit)
+    var_hourly = (ZERO if var_is_swap
+                  else funding_guard.normalize_hourly(var_asset.get("funding_rate"), var_basis, var_unit))
+    lit_hourly = (ZERO if lit_is_swap
+                  else funding_guard.normalize_hourly(lighter_funding.get("rate"), lit_basis, lit_unit))
     unit_warnings = []
-    if funding_guard.unit_hint_conflicts(var_asset.get("funding_rate"), var_unit):
+    if not var_is_swap and funding_guard.unit_hint_conflicts(var_asset.get("funding_rate"), var_unit):
         unit_warnings.append(f"variational funding magnitude conflicts with configured unit '{var_unit}'")
-    if funding_guard.unit_hint_conflicts(lighter_funding.get("rate"), lit_unit):
+    if not lit_is_swap and funding_guard.unit_hint_conflicts(lighter_funding.get("rate"), lit_unit):
         unit_warnings.append(f"lighter funding magnitude conflicts with configured unit '{lit_unit}'")
     spread_hourly = None
     if var_hourly is not None and lit_hourly is not None:
@@ -87,6 +114,8 @@ def market_snapshot(var_asset: dict[str, Any], lighter_contract: dict[str, Any],
         "funding_reference_interval_s": {"variational": var_ref, "lighter": lit_ref},
         "var_funding_hourly": var_hourly,
         "lighter_funding_hourly": lit_hourly,
+        "var_is_swap": var_is_swap,
+        "lighter_is_swap": lit_is_swap,
         "spread_hourly": spread_hourly,
         "basis": basis,
         "price_diff_abs": price_diff_abs,

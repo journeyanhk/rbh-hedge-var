@@ -532,7 +532,8 @@ class Engine:
             return
         try:
             live = reconcile.reconcile_positions(
-                self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+                self.lighter_symbol, lighter_read=self.lighter,
+                var_gateway=self._var_gateway, var_symbol=self.var_symbol)
         except Exception as exc:
             reason = f"recovery_reconcile_failed:{mode}"
             if self.sm.set_halt(reason):
@@ -606,7 +607,8 @@ class Engine:
             return None
         try:
             live = reconcile.reconcile_positions(
-                self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+                self.lighter_symbol, lighter_read=self.lighter,
+                var_gateway=self._var_gateway, var_symbol=self.var_symbol)
         except Exception as exc:
             # Transient read failure: log and retry next window rather than HALT.
             self._log(f"[IDLE FLAT-CHECK] reconcile failed (retry next window): {exc}")
@@ -829,7 +831,8 @@ class Engine:
         if self._var_gateway is not None:
             try:
                 live = reconcile.reconcile_positions(
-                    self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+                    self.lighter_symbol, lighter_read=self.lighter,
+                    var_gateway=self._var_gateway, var_symbol=self.var_symbol)
                 # P1-3: "flat" is within half a size step, not an arbitrary 1e-7.
                 half = self._size_step() / 2
                 pos = f"positions={ {k: str(v) for k, v in live.items()} }"
@@ -869,7 +872,8 @@ class Engine:
             return None
         try:
             live = reconcile.reconcile_positions(
-                self.lighter_symbol, lighter_read=self.lighter, var_gateway=self._var_gateway)
+                self.lighter_symbol, lighter_read=self.lighter,
+                var_gateway=self._var_gateway, var_symbol=self.var_symbol)
             self._reconcile_fail_streak = 0
             return live
         except reconcile.ReconcileError as exc:

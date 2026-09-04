@@ -20,8 +20,10 @@ class FakeVarGw:
     def __init__(self, qty=D("0"), raise_exc=None):
         self._qty = qty
         self._raise = raise_exc
+        self.seen_symbol = None
 
     def signed_position(self, symbol):
+        self.seen_symbol = symbol
         if self._raise:
             raise self._raise
         return self._qty
@@ -31,6 +33,19 @@ def test_reconcile_returns_signed_positions():
     read = FakeRead(positions=[{"symbol": "XAU", "qty": D("2.7")}])
     live = reconcile_positions("XAU", lighter_read=read, var_gateway=FakeVarGw(D("-2.7")))
     assert live == {"lighter": D("2.7"), "variational": D("-2.7")}
+
+
+def test_reconcile_reads_each_venue_with_its_own_symbol():
+    # var-desgin5 §2: Lighter trades XAU, Variational trades the XAUS swap. Each
+    # leg must be read with its own symbol or the var position reads as 0.
+    read = FakeRead(positions=[
+        {"symbol": "XAU", "qty": D("2.7")},
+        {"symbol": "XAUS", "qty": D("99")},   # must NOT be counted on the lighter side
+    ])
+    gw = FakeVarGw(D("-2.7"))
+    live = reconcile_positions("XAU", lighter_read=read, var_gateway=gw, var_symbol="XAUS")
+    assert live == {"lighter": D("2.7"), "variational": D("-2.7")}
+    assert gw.seen_symbol == "XAUS"
 
 
 def test_reconcile_raises_when_lighter_read_fails():

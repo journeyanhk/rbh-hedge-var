@@ -121,7 +121,7 @@ def cmd_reconcile(cfg) -> int:
     from .reconcile import ReconcileError, reconcile_positions
     try:
         live = reconcile_positions(eng.lighter_symbol, lighter_read=eng.lighter,
-                                   var_gateway=eng._var_gateway)
+                                   var_gateway=eng._var_gateway, var_symbol=eng.var_symbol)
     except ReconcileError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         return 1

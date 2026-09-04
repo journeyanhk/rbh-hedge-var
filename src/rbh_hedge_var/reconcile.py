@@ -25,13 +25,21 @@ class ReconcileError(RuntimeError):
     pass
 
 
-def reconcile_positions(symbol: str, *, lighter_read: Any, var_gateway: Any) -> dict[str, Decimal]:
+def reconcile_positions(lighter_symbol: str, *, lighter_read: Any, var_gateway: Any,
+                        var_symbol: str | None = None) -> dict[str, Decimal]:
     """Return {"lighter": signed_qty, "variational": signed_qty}.
+
+    Each venue is read with ITS OWN market symbol: Lighter trades ``XAU`` while
+    Variational may trade a different listing (e.g. the ``XAUS`` swap). Passing
+    one shared symbol to both would read the Variational position as 0 whenever
+    its listing differs — an invisible naked leg (var-desgin5 §2). ``var_symbol``
+    defaults to ``lighter_symbol`` for the single-listing case.
 
     Raises ReconcileError if EITHER venue cannot be read — an unknown leg is more
     dangerous than a known imbalance, so we refuse to guess.
     """
-    sym = symbol.upper()
+    lit_sym = lighter_symbol.upper()
+    var_sym = (var_symbol or lighter_symbol).upper()
 
     try:
         snap = lighter_read.account_snapshot()
@@ -39,11 +47,11 @@ def reconcile_positions(symbol: str, *, lighter_read: Any, var_gateway: Any) -> 
         raise ReconcileError(f"lighter account read failed: {exc}") from exc
     lit_qty = ZERO
     for p in (snap or {}).get("positions") or []:
-        if str(p.get("symbol", "")).upper() == sym:
+        if str(p.get("symbol", "")).upper() == lit_sym:
             lit_qty += D(p.get("qty"))
 
     try:
-        var_qty = D(var_gateway.signed_position(sym))
+        var_qty = D(var_gateway.signed_position(var_sym))
     except Exception as exc:
         raise ReconcileError(f"variational position read failed: {exc}") from exc
 

@@ -78,7 +78,11 @@ class VariationalOrderGateway:
         # the instrument identity (XAU=14400, NOT vo's hardcoded 3600).
         self._read_client = read_client
         self._meta_cache: dict[str, dict[str, Any]] = {}
-        self._funding_interval_s = int(vcfg.get("funding_interval_s") or 14400)
+        # A SWAP listing (XAUS) has funding_interval_s = 0. Preserve an explicit 0
+        # (only fall back to 14400 when the field is truly ABSENT) so the swap's
+        # instrument identity is not silently rebuilt as a 4h perp.
+        _fi = vcfg.get("funding_interval_s")
+        self._funding_interval_s = int(_fi) if _fi is not None else 14400
         self._settlement_asset = str(vcfg.get("settlement_asset", "USDC"))
         self._instrument_type = str(vcfg.get("instrument_type", "perpetual_rwa_future"))
         # `kind` is the venue's ASSET-CLASS discriminator on the instrument enum
@@ -153,7 +157,7 @@ class VariationalOrderGateway:
         if self._read_client is not None:
             try:
                 raw = (self._read_client.asset(sym) or {}).get("raw") or {}
-                if raw.get("funding_interval_s"):
+                if raw.get("funding_interval_s") is not None:
                     fi = int(raw["funding_interval_s"])
                 if raw.get("instrument_type"):
                     itype = str(raw["instrument_type"])
