@@ -244,7 +244,8 @@ def cmd_run(cfg) -> int:
     serve(cfg.get("state_file", "state.json"),
           get_snapshot=lambda: _display(eng.last_snapshot),
           host=cfg.get("monitor_bind", "127.0.0.1"),
-          port=int(cfg.get("monitor_port", 8012)))
+          port=int(cfg.get("monitor_port", 8012)),
+          cfg=cfg)
     interval = int(cfg.get("poll_interval_seconds", 60))
     mode = "LIVE" if live else "shadow"
     print(f"[run] {mode} engine started; poll={interval}s. Ctrl-C to stop.", flush=True)
