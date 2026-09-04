@@ -62,6 +62,24 @@ def test_force_leave_cooldown(tmp_path):
     assert sm.force_leave_cooldown() is False
 
 
+def test_clamp_cooldown_shortens_in_progress(tmp_path):
+    sm = _sm(tmp_path)
+    sm.begin_entry("var_short_lit_long", "signal")
+    sm.confirm_hold([{"venue": "variational", "side": "sell", "qty": "2", "price": "4321"}])
+    sm.begin_exit("reversal")
+    sm.finish_exit(1.0, 0.0, "reversal", cooldown_s=100000)   # 27h stale cooldown
+    assert sm.mode == COOLDOWN
+    # config lowered to 5s: clamp brings the absolute deadline down.
+    assert sm.clamp_cooldown(5) is True
+    assert int(sm.state["cooldown_until"]) <= int(time.time()) + 5
+    # clamp never EXTENDS.
+    assert sm.clamp_cooldown(100000) is False
+    # after the (now short) window elapses it leaves cooldown.
+    time.sleep(5.1)
+    assert sm.maybe_leave_cooldown() is True
+    assert sm.mode == IDLE
+
+
 def test_illegal_transition_raises(tmp_path):
     sm = _sm(tmp_path)
     try:

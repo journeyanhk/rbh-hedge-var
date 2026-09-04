@@ -102,8 +102,11 @@ def cmd_clear_cooldown(cfg) -> int:
         "cooldown": False,
         "cleared": True,
         "mode": sm.mode,
-        "message": "COOLDOWN cleared -> IDLE; next tick may open a new round. "
-                   "Note: config close_cooldown_seconds only sets FUTURE cooldowns.",
+        "message": "COOLDOWN cleared -> IDLE. NOTE: only effective while the "
+                   "service is STOPPED — a running engine holds state in memory "
+                   "and rewrites state.json each tick, clobbering this. To skip a "
+                   "live cooldown, prefer lowering close_cooldown_seconds (the "
+                   "engine re-clamps in-progress cooldowns each tick).",
         "was_until": until,
     }, indent=2, default=str))
     return 0

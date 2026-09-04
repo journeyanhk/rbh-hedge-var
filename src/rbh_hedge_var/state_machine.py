@@ -192,6 +192,27 @@ class StateMachine:
         except Exception:
             pass  # ledger is best-effort; never block the state machine
 
+    def clamp_cooldown(self, max_seconds: int) -> bool:
+        """Shorten an over-long in-progress cooldown to now + max_seconds.
+
+        cooldown_until is written as an ABSOLUTE timestamp at close time, so a
+        later change to close_cooldown_seconds would otherwise never take effect
+        on a cooldown already in progress. Called each tick with the CURRENT
+        config value, this lets a config change (after restart) actually shorten
+        the wait. Only ever SHORTENS — never extends — so it can't defeat a
+        genuine spacing interval. Returns True if it changed anything."""
+        if self.mode != COOLDOWN:
+            return False
+        until = self.state.get("cooldown_until")
+        if until is None:
+            return False
+        ceiling = int(time.time()) + int(max_seconds)
+        if int(until) > ceiling:
+            self.state["cooldown_until"] = ceiling
+            self.save()
+            return True
+        return False
+
     def maybe_leave_cooldown(self) -> bool:
         if self.mode != COOLDOWN:
             return False

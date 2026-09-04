@@ -226,6 +226,11 @@ class Engine:
         action = "none"
 
         if mode == COOLDOWN:
+            # Re-clamp an over-long persisted cooldown to the CURRENT configured
+            # value so editing close_cooldown_seconds (+ restart) actually takes
+            # effect on an in-progress cooldown instead of waiting out the old
+            # absolute timestamp.
+            self.sm.clamp_cooldown(int(self.cfg.get("close_cooldown_seconds", 1200)))
             if self.sm.maybe_leave_cooldown():
                 action = "cooldown_elapsed->idle"
 
