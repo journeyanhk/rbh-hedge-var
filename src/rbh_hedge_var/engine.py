@@ -403,8 +403,67 @@ class Engine:
         return "entry_aborted"
 
     def _do_exit(self, reason: str, snap: dict[str, Any]) -> str:
+        # review16 incident guard (Fix-2): NEVER transition a LIVE round into
+        # EXITING when its executor cannot actually trade (write-guard armed).
+        # The 2026-09-04 incident did exactly that — begin_exit() persisted
+        # EXITING, then close_hedge()'s self._guard() raised WriteBlockedError
+        # UNCAUGHT, stranding the state machine in EXITING with both legs open;
+        # the next tick's recovery then HALTed on the residual. Instead: detect
+        # the un-tradeable executor FIRST, latch HALT, and STAY in HOLDING with a
+        # clear reason so the round is always fully-managed-or-halted, never half.
+        shadow = bool(self.sm.state.get("shadow", True))
+        if not shadow and net_guard.is_armed():
+            r = f"live_exit_blocked_guard_armed:{reason}"
+            if self.sm.set_halt(r):
+                self._log(f"[EXIT BLOCKED] live exit '{reason}' but write-guard ARMED "
+                          f"-> HALT (stays HOLDING, no state stranding)")
+                self._alert(f"🛑 HALT: live exit '{reason}' blocked — write-guard armed, "
+                            f"cannot close. Flatten manually or re-arm, then `clear-halt`.")
+            return f"exit_blocked_guard_armed:{reason}"
         self.sm.begin_exit(reason)
-        return self._close_and_finish(reason, snap)
+        if shadow:
+            return self._close_and_finish(reason, snap)
+        # Live close: any failure DURING the close (guard flip, network, RFQ
+        # reject) must fail LOUD, not crash the tick and silently strand EXITING.
+        try:
+            return self._close_and_finish(reason, snap)
+        except Exception as exc:
+            r = f"exit_failed:{type(exc).__name__}"
+            if self.sm.set_halt(r):
+                self._log(f"[EXIT FAILED] live close '{reason}' raised {exc} "
+                          f"-> HALT (mode=EXITING; verify venues before clear-halt)")
+                self._alert(f"🛑 HALT: live close '{reason}' failed: {exc}. "
+                            f"Verify both venues, flatten any residual, then `clear-halt`.")
+            return f"exit_error:{type(exc).__name__}"
+
+    def halt_if_unmanageable_live_round(self, live: bool) -> str | None:
+        """Fix-1 (review16 incident): refuse to run a LIVE round half-managed.
+
+        If state.json carries a LIVE round (shadow=False) in an active mode but
+        the process did NOT arm live orders (write-guard armed — e.g. a restart
+        WHILE holding fails the ``book_flat`` preflight and never re-arms), the
+        engine can READ the position but cannot CLOSE it: the first exit trigger
+        would raise WriteBlockedError. That is the exact time-bomb the incident
+        hit. Latch HALT NOW with precise guidance so the operator flattens or
+        re-arms deliberately, rather than discovering it at exit time.
+
+        This also HARD-ENFORCES the deploy-window discipline: you may not resume
+        a live round under an armed guard — flatten & restart from flat, or
+        clear-halt to acknowledge. Returns the halt reason if it latched one."""
+        active = self.sm.mode in (ENTERING, HOLDING, EXITING)
+        live_round = not bool(self.sm.state.get("shadow", True))
+        if live or not active or not live_round or self.sm.is_halted():
+            return None
+        reason = f"live_round_guard_armed:{self.sm.mode}"
+        if self.sm.set_halt(reason):
+            self._log(f"[STARTUP HALT] live round in state.json (mode={self.sm.mode}) but "
+                      f"write-guard ARMED — cannot manage/close it. Flatten & clear-halt "
+                      f"from flat, or fix preflight + set RBH_HEDGE_LIVE_ARM to resume.")
+            self._alert(f"🛑 HALT: a LIVE round is open (mode={self.sm.mode}) but the "
+                        f"write-guard is ARMED — the engine cannot close it and would "
+                        f"strand on the next exit. Flatten both legs and `clear-halt` from "
+                        f"flat, OR fix preflight + set RBH_HEDGE_LIVE_ARM to resume.")
+        return reason
 
     def _close_and_finish(self, reason: str, snap: dict[str, Any]) -> str:
         """Close both legs and book the round. Assumes state is already EXITING

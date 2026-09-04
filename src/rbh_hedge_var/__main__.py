@@ -241,6 +241,15 @@ def cmd_run(cfg) -> int:
             eng.tg.send(warn)
         except Exception:
             pass
+    # review16 incident (Fix-1): the DANGEROUS inverse — a LIVE round persisted
+    # in state.json while the write-guard stayed ARMED (a restart WHILE holding
+    # fails book_flat preflight and never re-arms). The engine could read it but
+    # not close it; the first exit trigger stranded the state in EXITING. Refuse
+    # to run half-managed: latch HALT now with precise operator guidance.
+    halted = eng.halt_if_unmanageable_live_round(live)
+    if halted:
+        print(f"[run] STARTUP HALT: {halted} — not trading until resolved "
+              "(flatten & clear-halt from flat, or fix preflight + arm).", flush=True)
     serve(cfg.get("state_file", "state.json"),
           get_snapshot=lambda: _display(eng.last_snapshot),
           host=cfg.get("monitor_bind", "127.0.0.1"),

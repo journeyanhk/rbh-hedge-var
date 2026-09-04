@@ -121,3 +121,76 @@ def test_live_positions_none_for_shadow_round(tmp_path):
     eng = _engine(tmp_path, live=True)
     eng.sm.state["shadow"] = True
     assert eng._live_positions() is None
+
+
+# --- review16 incident fixes: never manage a live round under an armed guard ---
+
+_LEGS = [
+    {"venue": "variational", "symbol": "XAU", "side": "sell", "qty": "2.7", "price": "4330"},
+    {"venue": "lighter", "symbol": "XAU", "side": "buy", "qty": "2.7", "price": "4320"},
+]
+
+
+def _open_live_round(eng):
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng._do_entry("short_var_long_lighter", "t", _snap())
+    assert eng.sm.mode == SM.HOLDING and eng.sm.state["shadow"] is False
+
+
+def test_live_exit_blocked_when_guard_armed_stays_holding(tmp_path):
+    # Fix-2: the exact incident — an exit fires on a live round while the guard
+    # is armed. Must NOT transition to EXITING then crash; must HALT + stay HOLDING.
+    eng = _engine(tmp_path, live=True)
+    _open_live_round(eng)
+    net_guard.arm()  # restart-while-holding left the guard armed
+    action = eng._do_exit("take_profit", _snap())
+    assert action.startswith("exit_blocked_guard_armed")
+    assert eng.sm.mode == SM.HOLDING, "must not strand in EXITING"
+    assert eng.sm.is_halted()
+    assert "live_exit_blocked_guard_armed" in (eng.sm.halt_reason() or "")
+
+
+def test_live_exit_failure_halts_instead_of_crashing(tmp_path):
+    # Fix-2 defense-in-depth: a failure DURING the close must fail loud (HALT),
+    # not bubble uncaught out of tick() and silently strand EXITING.
+    eng = _engine(tmp_path, live=True)
+    _open_live_round(eng)
+
+    def boom(*a, **k):
+        raise RuntimeError("rfq reject")
+
+    eng._live_executor.close_hedge = boom
+    action = eng._do_exit("take_profit", _snap())
+    assert action.startswith("exit_error:RuntimeError")
+    assert eng.sm.is_halted()
+    assert "exit_failed:RuntimeError" in (eng.sm.halt_reason() or "")
+
+
+def test_startup_halt_when_live_round_but_guard_armed(tmp_path):
+    # Fix-1: a persisted LIVE round + armed guard (live=False) = unmanageable.
+    eng = _engine(tmp_path, live=True)
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(_LEGS)
+    eng.sm.state["shadow"] = False
+    eng.sm.save()
+    reason = eng.halt_if_unmanageable_live_round(live=False)
+    assert reason and reason.startswith("live_round_guard_armed:HOLDING")
+    assert eng.sm.is_halted()
+
+
+def test_startup_no_halt_when_live_armed(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(_LEGS)
+    eng.sm.state["shadow"] = False
+    eng.sm.save()
+    assert eng.halt_if_unmanageable_live_round(live=True) is None
+    assert not eng.sm.is_halted()
+
+
+def test_startup_no_halt_for_shadow_round(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    eng.sm.begin_entry("short_var_long_lighter", "t")
+    eng.sm.confirm_hold(_LEGS)  # shadow defaults True
+    assert eng.halt_if_unmanageable_live_round(live=False) is None
+    assert not eng.sm.is_halted()
