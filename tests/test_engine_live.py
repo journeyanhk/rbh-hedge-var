@@ -360,3 +360,40 @@ def test_metadata_overlay_forces_earlier_close(tmp_path):
     assert sess["open"] is True
     assert sess["seconds_to_close"] <= 600
     assert sess.get("seconds_to_close_source") == "metadata"
+
+
+# --- review19: HALT must flatten first, and must not blind an open round ------
+
+def test_drawdown_halt_flattens_before_latching(tmp_path):
+    # review19: a drawdown HALT that trips while HOLDING must CLOSE the round
+    # first (so the leg isn't left naked vs the 24/7 Lighter side), THEN latch.
+    eng = _engine(tmp_path, live=True)
+    _open_live_round(eng)
+    _match_positions(eng)
+    eng.fetch_snapshot = lambda: _snap()
+    # push today's PnL below the daily-loss floor
+    eng.sm.state["daily_pnl"] = {}
+    from rbh_hedge_var.state_machine import _utc_day
+    eng.sm.state["daily_pnl"][_utc_day()] = -999.0
+    sent = _capture_alerts(eng)
+    out = eng.tick()
+    assert eng.sm.is_halted()
+    # round was flattened (not stranded in HOLDING/ENTERING)
+    assert eng.sm.mode in (SM.COOLDOWN, SM.IDLE), f"expected flattened, got {eng.sm.mode}"
+    assert any("flatten" in m.lower() for m in sent)
+    assert out["halt"]
+
+
+def test_halted_holding_round_still_marks_to_market(tmp_path):
+    # review19: HALT stops OPENING new rounds; it must NOT blind the risk view of
+    # a round we are still carrying. A halted+HOLDING tick populates live MTM.
+    eng = _engine(tmp_path, live=True)
+    _open_live_round(eng)
+    eng.fetch_snapshot = lambda: _snap()
+    eng.sm.set_halt("manual_test")
+    assert eng.sm.mode == SM.HOLDING and eng.sm.is_halted()
+    out = eng.tick()
+    assert out["action"] == "halted"
+    snap = out["snapshot"]
+    # read-only MTM populated the unrealized fields for the dashboard
+    assert "unrealized_total_pnl_usdt" in snap or "round_pnl_vs_entry_usdt" in snap

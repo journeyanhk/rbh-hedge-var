@@ -285,16 +285,31 @@ class Engine:
         # 3) Latched HALT (P1-5): once tripped, refuse all TRADING until a human
         #    runs `clear-halt`. Snapshot above is fresh, so the dashboard stays
         #    live; we only skip the trading decision here.
+        #    review19: HALT stops OPENING new rounds — it must NOT blind the risk
+        #    view of an already-open round. If we still hold legs, mark them to
+        #    market read-only (no accrual, no exit) so the dashboard shows the live
+        #    unrealized PnL and a human can decide to flatten manually.
         if self.sm.is_halted():
+            if self.sm.mode == HOLDING:
+                self._mtm_readonly(snap)
             return {"ok": True, "mode": self.sm.mode, "halt": self.sm.halt_reason(),
                     "action": "halted", "snapshot": _display(snap)}
 
         # 4) Drawdown circuit breaker -> latch HALT (P1-5).
+        #    review19: a HALT must FLATTEN first, then latch. The old order latched
+        #    immediately, so a drawdown that tripped while HOLDING froze the open
+        #    round (naked vs the 24/7 Lighter leg) until a human ran clear-halt.
+        #    Flatten while we still can, THEN latch so no NEW round opens.
         dd = watchdog.check_drawdown(D(self.sm.today_pnl()), D(self.cfg.get("max_daily_loss_usdt", 15)))
         if not dd.ok:
+            if self.sm.mode == HOLDING:
+                self._log(f"[HALT] {dd.reason} while HOLDING -> flatten before latching")
+                self._alert(f"🛑 Drawdown ({dd.reason}) hit while a round is open — flattening first.")
+                self._do_exit("daily_loss_halt", snap)
             if self.sm.set_halt(dd.reason):
                 self._log(f"[HALT] {dd.reason}")
                 self._alert(f"🛑 HALT (drawdown): {dd.reason}. Run `clear-halt` to resume.")
+            self.sm.save()
             return {"ok": True, "mode": self.sm.mode, "halt": dd.reason, "snapshot": _display(snap)}
 
         mode = self.sm.mode
@@ -331,6 +346,31 @@ class Engine:
         return {"ok": True, "mode": self.sm.mode, "action": action, "snapshot": _display(snap)}
 
     # ---- holding: accrual + MTM + watchdog + exit --------------------------
+    def _mtm_readonly(self, snap: dict[str, Any]) -> None:
+        """review19: mark the open legs to market WITHOUT any side effects (no
+        funding accrual, no exit, no state writes) so a HALTed-but-still-HOLDING
+        round keeps a live risk view on the dashboard. HALT stops opening new
+        rounds; it must not blind us to the round we are still carrying."""
+        legs = self.sm.state.get("legs") or []
+        if not legs:
+            return
+        try:
+            book = self._safe_book()
+            executor = self._executor_for(bool(self.sm.state.get("shadow", True)))
+            price_pnl = executor.mark_to_market(
+                legs, snap.get("var_price") or ZERO, snap.get("lighter_price") or ZERO, book,
+            )
+            funding_pnl = D(self.sm.funding_accrued())
+            total_pnl = price_pnl + funding_pnl
+            baseline = D(self.sm.state.get("entry_mtm_usdt") or 0)
+            snap["unrealized_price_pnl_usdt"] = price_pnl
+            snap["funding_accrued_usdt"] = funding_pnl
+            snap["unrealized_total_pnl_usdt"] = total_pnl
+            snap["entry_mtm_usdt"] = baseline
+            snap["round_pnl_vs_entry_usdt"] = total_pnl - baseline
+        except Exception as exc:  # never let the read-only view break the tick
+            self._log(f"[HALT-MTM] read-only mark failed: {type(exc).__name__}: {exc}")
+
     def _hold_tick(self, snap: dict[str, Any]) -> str:
         direction = self.sm.state.get("direction") or ""
         legs = self.sm.state.get("legs") or []

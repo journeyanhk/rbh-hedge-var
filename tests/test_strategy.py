@@ -212,6 +212,24 @@ def test_take_profit_triggers():
     assert should and "take_profit" in reason
 
 
+def test_take_profit_buffer_blocks_marginal_mtm():
+    # review19 (止盈实亏): a marginal MTM print that only just clears the raw
+    # threshold must NOT fire when a realizable buffer is configured — it is not
+    # robustly realizable once the real close crosses the spread.
+    cfg = {"take_profit_total_pnl_usdt": 0.1, "take_profit_realizable_buffer_usdt": 0.3}
+    should, _ = strategy.take_profit_signal(Decimal("0.23"), cfg)
+    assert not should
+
+
+def test_take_profit_buffer_fires_when_cleared():
+    cfg = {"take_profit_total_pnl_usdt": 0.8, "take_profit_realizable_buffer_usdt": 0.3}
+    should, reason = strategy.take_profit_signal(Decimal("1.2"), cfg)
+    assert should and "realizable" in reason
+    # exactly at threshold+buffer fires; a hair below does not
+    assert strategy.take_profit_signal(Decimal("1.1"), cfg)[0]
+    assert not strategy.take_profit_signal(Decimal("1.09"), cfg)[0]
+
+
 def test_price_diff_gate_disabled_when_zero():
     # review16: max_entry_price_diff_usdt=0 DISABLES the price-diff gate so a wide
     # but favourable spread no longer blocks entry.

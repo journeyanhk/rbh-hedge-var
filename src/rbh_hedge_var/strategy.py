@@ -239,9 +239,24 @@ def exit_signal(snap: dict[str, Any], direction: str, cfg: dict[str, Any],
 
 
 def take_profit_signal(total_pnl: Any, cfg: dict[str, Any]) -> tuple[bool, str]:
+    """Fire when the marked-to-market round PnL clears the take-profit threshold.
+
+    review19 (止盈实亏 incident 21:43): the MTM total can print a small positive
+    (+0.23) that is NOT actually realizable once the real close crosses the
+    spread — the round then books a loss (−0.51). We require the MTM to clear the
+    threshold by an extra ``take_profit_realizable_buffer_usdt`` so take-profit
+    only fires when the gain is robust to exit-cost/MTM error. Buffer defaults to
+    0 (legacy behaviour) and is disabled when <= 0.
+    """
     threshold = D(cfg.get("take_profit_total_pnl_usdt", 0) or 0)
+    buffer = D(cfg.get("take_profit_realizable_buffer_usdt", 0) or 0)
+    if buffer < ZERO:
+        buffer = ZERO
     pnl = D(total_pnl)
-    if threshold > ZERO and pnl >= threshold:
+    trigger = threshold + buffer
+    if threshold > ZERO and pnl >= trigger:
+        if buffer > ZERO:
+            return True, f"take_profit {pnl} >= {threshold}+{buffer} (realizable)"
         return True, f"take_profit {pnl} >= {threshold}"
     return False, ""
 
