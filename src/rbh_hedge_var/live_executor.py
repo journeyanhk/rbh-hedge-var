@@ -175,6 +175,7 @@ class LiveExecutor:
         legs_sorted = sorted(legs, key=lambda leg_x: 0 if leg_x["venue"] == "variational" else 1)
         price_pnl = ZERO
         closed = []
+        sources: list[str] = []
         for leg in legs_sorted:
             entry = D(leg["price"])
             qty = D(leg["qty"])
@@ -182,19 +183,19 @@ class LiveExecutor:
             close_side = "buy" if open_side == "sell" else "sell"
             base = self._signed(leg["venue"], leg["symbol"])
             if leg["venue"] == "variational":
-                self.var.submit_market_order(close_side, qty, symbol=leg["symbol"], reduce_only=True)
-                # No venue fills endpoint yet: estimate exit on the executable
-                # price (ref + slippage), NOT the raw mark. Confirm the position
-                # actually reduced toward flat.
-                exit_price = pricing.model_fill_price(close_side, D(var_price), None, qty, self.slippage)
+                resp = self.var.submit_market_order(close_side, qty, symbol=leg["symbol"],
+                                                    reduce_only=True)
+                exit_price, exit_source = self._real_or_model_exit(
+                    resp, close_side, D(var_price), None, qty)
                 step = D("0.0001")
             else:
-                self.lighter.place_market_order(leg["symbol"], close_side, qty, lit_price,
-                                                reduce_only=True)
+                resp = self.lighter.place_market_order(leg["symbol"], close_side, qty, lit_price,
+                                                       reduce_only=True)
                 levels = None
                 if lit_book:
                     levels = lit_book.get("bids") if close_side == "sell" else lit_book.get("asks")
-                exit_price = pricing.model_fill_price(close_side, D(lit_price), levels, qty, self.slippage)
+                exit_price, exit_source = self._real_or_model_exit(
+                    resp, close_side, D(lit_price), levels, qty)
                 step = D("0.0001")
             # confirm the leg reduced (delta opposes the open side)
             delta = self._confirm_delta(leg["venue"], leg["symbol"], base,
@@ -203,9 +204,45 @@ class LiveExecutor:
                 price_pnl += (exit_price - entry) * qty
             else:
                 price_pnl += (entry - exit_price) * qty
-            closed.append({**leg, "exit_price": str(exit_price), "closed": True,
-                           "close_confirmed_delta": str(delta)})
-        return {"shadow": False, "legs": closed, "price_pnl": price_pnl}
+            sources.append(exit_source)
+            closed.append({**leg, "exit_price": str(exit_price), "exit_source": exit_source,
+                           "closed": True, "close_confirmed_delta": str(delta)})
+        if all(s == "venue_order" for s in sources):
+            source = "venue_order"
+        elif all(s == "model" for s in sources):
+            source = "model"
+        else:
+            source = "mixed"
+        return {"shadow": False, "legs": closed, "price_pnl": price_pnl,
+                "price_pnl_source": source}
+
+    def _real_or_model_exit(self, resp: Any, close_side: str, ref_price: Decimal,
+                            levels: list[tuple[Decimal, Decimal]] | None,
+                            qty: Decimal) -> tuple[Decimal, str]:
+        """Price a close leg from the venue's REAL order price when available,
+        else the executable model.
+
+        review18: the close-out ledger was pricing EVERY exit off the stale
+        snapshot mid ± a flat 5bps taker slippage. On the illiquid XAUS swap the
+        real RFQ bid/ask spread dwarfs 5bps, so a genuine -8.63 swap close was
+        booked as ~-3.07 — turning a -1.34 losing round into a fake +4.24 profit.
+        The order response already carries the truth: ``reported_fill_price``
+        (the venue's fill) or, failing that, ``ref_price`` (the side-aware RFQ
+        quote actually referenced for THIS order — a sell lifts the bid, a buy
+        hits the ask). Prefer those; fall back to the model only when the
+        response has no usable price (e.g. Lighter, whose deep book makes the
+        modelled VWAP a faithful proxy)."""
+        real = None
+        if isinstance(resp, dict):
+            real = resp.get("reported_fill_price") or resp.get("ref_price")
+        if real is not None:
+            try:
+                px = D(real)
+                if px > ZERO:
+                    return px, "venue_order"
+            except (ArithmeticError, ValueError, TypeError):
+                pass
+        return pricing.model_fill_price(close_side, ref_price, levels, qty, self.slippage), "model"
 
     # ---- mark-to-market (pure, no orders) ---------------------------------
     def mark_to_market(self, legs: list[dict[str, Any]],

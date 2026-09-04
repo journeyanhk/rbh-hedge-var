@@ -145,7 +145,7 @@ class StateMachine:
         self.transition(EXITING, reason)
 
     def finish_exit(self, price_pnl: float, funding_pnl: float, reason: str,
-                    cooldown_s: int) -> None:
+                    cooldown_s: int, extra: dict[str, Any] | None = None) -> None:
         """Close a round. Round PnL = price leg PnL + accrued funding (P0-1).
 
         Both components are stored separately in history and in the append-only
@@ -169,6 +169,12 @@ class StateMachine:
             "pnl": total,
             "shadow": bool(self.state.get("shadow", True)),
         }
+        if extra:
+            # review18: audit fields (e.g. price_pnl_source) — never overwrite a
+            # core field, and drop Nones so shadow rounds stay clean.
+            for k, v in extra.items():
+                if v is not None and k not in record:
+                    record[k] = v
         history = list(self.state.get("round_history") or [])
         history.append(record)
         self.state["round_history"] = history[-20:]     # bounded live view

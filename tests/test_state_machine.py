@@ -159,3 +159,26 @@ def test_halt_latches_and_clears(tmp_path):
     assert sm2.is_halted() is True
     sm2.clear_halt()
     assert sm2.is_halted() is False
+
+
+def test_finish_exit_records_audit_extra_and_drops_none(tmp_path):
+    # review18: price_pnl_source (and other audit fields) flow into the round
+    # record; None values are dropped so shadow rounds stay clean.
+    sm = _sm(tmp_path)
+    sm.begin_entry("short_var_long_lighter", "signal")
+    sm.confirm_hold([{"venue": "variational", "side": "sell", "qty": "2", "price": "4327"}])
+    sm.begin_exit("tp")
+    sm.finish_exit(1.0, 0.0, "tp", cooldown_s=1,
+                   extra={"price_pnl_source": "venue_order", "ignored": None})
+    rec = sm.state["round_history"][-1]
+    assert rec["price_pnl_source"] == "venue_order"
+    assert "ignored" not in rec
+    # core fields must never be overwritten by extra
+    d2 = tmp_path / "sm2"
+    d2.mkdir()
+    sm2 = StateMachine(str(d2 / "state.json"))
+    sm2.begin_entry("short_var_long_lighter", "s")
+    sm2.confirm_hold([{"venue": "variational", "side": "sell", "qty": "1", "price": "4300"}])
+    sm2.begin_exit("r")
+    sm2.finish_exit(2.0, 0.0, "r", cooldown_s=1, extra={"pnl": 999.0})
+    assert sm2.state["round_history"][-1]["pnl"] == 2.0

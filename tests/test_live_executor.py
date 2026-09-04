@@ -182,3 +182,56 @@ def test_mtm_matches_shadow_and_works_while_armed():
     live = _exec().mark_to_market(legs, D("4331"), D("4322"), None)  # armed: pure, no raise
     shadow = ShadowExecutor(dict(CFG)).mark_to_market(legs, D("4331"), D("4322"), None)
     assert live == shadow
+
+
+class RefPriceVar(FakeVar):
+    """Variational fake whose order response carries the venue's REAL price
+    (reported_fill_price), like the live gateway. Models the wide swap spread
+    that a stale snapshot mid hides."""
+
+    def __init__(self, entry="4470", real_fill="4406"):
+        super().__init__(entry=entry)
+        self.real_fill = D(real_fill)
+
+    def submit_market_order(self, side, qty, *, symbol="XAU", reduce_only=False,
+                            max_slippage_pct=D("0.002")):
+        resp = super().submit_market_order(side, qty, symbol=symbol, reduce_only=reduce_only,
+                                           max_slippage_pct=max_slippage_pct)
+        resp["reported_fill_price"] = str(self.real_fill)
+        return resp
+
+
+def test_close_books_real_swap_fill_not_stale_mid():
+    # review18 incident: on a long-V close the stale snapshot mid (4456) sits far
+    # above the real swap fill (4406). The OLD model priced the exit off the mid
+    # and booked a fake profit; the fix prices it off the venue's real fill.
+    var, lit = RefPriceVar(entry="4470", real_fill="4406"), FakeLighter(entry="4472")
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    legs = [
+        {"venue": "variational", "symbol": "XAU", "side": "buy", "qty": "0.1119", "price": "4470"},
+        {"venue": "lighter", "symbol": "XAU", "side": "sell", "qty": "0.1119", "price": "4472"},
+    ]
+    out = ex.close_hedge(legs, D("4456"), D("4407"), None)  # stale optimistic mid
+    var_leg = [c for c in out["legs"] if c["venue"] == "variational"][0]
+    assert var_leg["exit_source"] == "venue_order"
+    assert D(var_leg["exit_price"]) == D("4406")
+    # true economics: a small LOSS, not the fake +profit the mid-model produced
+    assert out["price_pnl"] < 0
+    assert out["price_pnl"] > D("-1")
+    assert out["price_pnl_source"] == "mixed"   # var=venue, lit=model
+
+
+def test_close_falls_back_to_model_without_venue_price():
+    # backward-compat: a gateway that returns no real price still books on the
+    # model (Lighter's deep book makes that faithful), flagged as such.
+    var, lit = FakeVar(entry="4325"), FakeLighter()
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    legs = [
+        {"venue": "variational", "symbol": "XAU", "side": "sell", "qty": "2.7", "price": "4330"},
+        {"venue": "lighter", "symbol": "XAU", "side": "buy", "qty": "2.7", "price": "4320"},
+    ]
+    out = ex.close_hedge(legs, D("4331"), D("4322"), None)
+    assert out["price_pnl_source"] == "model"
+    assert all(leg["exit_source"] == "model" for leg in out["legs"])

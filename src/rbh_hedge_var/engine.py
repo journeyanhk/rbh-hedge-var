@@ -592,14 +592,24 @@ class Engine:
         result = executor.close_hedge(legs, var_price, lit_price, book)
         price_pnl = float(result.get("price_pnl") or 0)
         funding_pnl = self.sm.funding_accrued()   # P0-1: booked separately
+        pnl_source = result.get("price_pnl_source")
         self.sm.finish_exit(price_pnl, funding_pnl, reason,
-                            int(self.cfg.get("close_cooldown_seconds", 1200)))
+                            int(self.cfg.get("close_cooldown_seconds", 1200)),
+                            extra={"price_pnl_source": pnl_source})
         # P1-5: tag the ledger line by the round's persisted shadow flag so a
         # live close is never mislabelled as shadow.
         shadow = bool(self.sm.state.get("shadow", True))
         tag = "SHADOW" if shadow else "LIVE"
         self._log(f"[{tag} CLOSE] {reason} | price_pnl={fmt(price_pnl,4)} "
-                  f"funding_pnl={fmt(funding_pnl,4)} total={fmt(price_pnl + funding_pnl,4)}")
+                  f"funding_pnl={fmt(funding_pnl,4)} total={fmt(price_pnl + funding_pnl,4)}"
+                  + (f" src={pnl_source}" if pnl_source else ""))
+        # review18: a LIVE round booked on the MODEL (venue gave no real fill
+        # price) is only an ESTIMATE — the recorded number can drift from the
+        # exchange statement. Surface it so the operator knows to reconcile.
+        if not shadow and pnl_source in ("model", "mixed"):
+            self._alert(f"ℹ️ LIVE close booked on {pnl_source} price (no venue fill price) — "
+                        f"recorded PnL {fmt(price_pnl + funding_pnl, 2)}U is an estimate; "
+                        f"reconcile against the exchange statement.")
         return f"{'shadow' if shadow else 'live'}_close:{reason}"
 
     def _recover(self, mode: str) -> None:
