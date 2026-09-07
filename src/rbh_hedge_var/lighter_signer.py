@@ -267,8 +267,13 @@ class LighterSignerClient:
         abandoning to a taker.
 
         The SDK's ``cancel_all_orders(time_in_force, timestamp_ms,
-        cancel_all_market_index=...)`` requires a scheduling TIF + timestamp;
-        we cancel IMMEDIATELY. Older single-arg SDKs are tolerated via inspect.
+        cancel_all_market_index=...)`` takes a scheduling TIF + a scheduled time.
+        We cancel IMMEDIATELY, so ``timestamp_ms`` MUST be 0 (nil): the venue
+        rejects an immediate cancel that carries a non-nil CancelAllTime with
+        'CancelAllTime should be nil' (review22 — this exact reject, silently
+        swallowed pre-review22, is what left the 13:09 zombie order). Only a
+        SCHEDULED/ABORT TIF carries a real future timestamp. Older single-arg
+        SDKs are tolerated via inspect.
         """
         if net_guard.is_armed():
             raise net_guard.WriteBlockedError("write-guard armed: refusing Lighter cancel_all")
@@ -282,7 +287,7 @@ class LighterSignerClient:
             tif_immediate = getattr(signer, "CANCEL_ALL_TIF_IMMEDIATE", 0)
             kwargs: dict[str, Any] = {
                 "time_in_force": tif_immediate,
-                "timestamp_ms": int(time.time() * 1000),
+                "timestamp_ms": 0,   # IMMEDIATE => CancelAllTime must be nil (0)
             }
             if market_index is not None and "cancel_all_market_index" in params:
                 kwargs["cancel_all_market_index"] = market_index

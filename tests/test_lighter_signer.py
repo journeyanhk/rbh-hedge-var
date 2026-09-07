@@ -214,7 +214,10 @@ def test_cancel_all_scopes_to_market_with_new_signature():
     assert out["cancelled"] is True and out["market_index"] == 40
     tif, ts, mkt = signer.cancel_calls[0]
     assert tif == FakeSigner.CANCEL_ALL_TIF_IMMEDIATE
-    assert mkt == 40 and ts > 0
+    # review22: IMMEDIATE cancel MUST carry a nil (0) CancelAllTime — a real
+    # timestamp made the venue reject with 'CancelAllTime should be nil', which
+    # (silently swallowed pre-review22) left the 13:09 zombie order.
+    assert mkt == 40 and ts == 0
 
 
 def test_cancel_all_blocked_while_armed():
