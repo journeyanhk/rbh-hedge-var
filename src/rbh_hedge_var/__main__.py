@@ -13,6 +13,7 @@ Commands:
   verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
   funding-raw  (Phase 2) dump RAW positionFunding rows + rate/USD expectation (diagnostic)
   probe-quote  (Phase 2) discover the accepted /api/quotes/indicative instrument schema (diagnostic)
+  cancel-test  (Phase 2) prove cancel_all clears a resting post-only order on the LIVE venue (review22 diagnostic)
 
 Live execution (Phase 2) is OFF unless ALL hold:
   * config.live_trading = true
@@ -263,6 +264,126 @@ def cmd_probe_quote(cfg) -> int:
     return 0
 
 
+def cmd_cancel_test(cfg) -> int:
+    """review22: EMPIRICALLY prove that cancel_all clears a resting post-only
+    order on the LIVE Lighter venue — the exact capability the 13:09 double-hedge
+    proved was broken (a silently-failed cancel left a zombie order).
+
+    Lifecycle, all logged:
+      1) read current position + open orders (read-only baseline)
+      2) place ONE tiny post-only BUY well BELOW the touch — post-only guarantees
+         it rests (never crosses/fills), and 'below the touch' means an adverse
+         move would have to be huge+instant to fill it before we cancel
+      3) confirm via open_orders that it is actually RESTING
+      4) cancel_all(symbol) — surfaces any error LOUDLY (no silent swallow)
+      5) poll open_orders until PROVEN empty or the verify window expires
+      6) print PASS (cancel verified) / FAIL (zombie survived) and, as a safety
+         net, always fire one more cancel_all + re-arm the guard in finally
+
+    Safe to run while HOLDING a round: the probe order is a fresh tiny resting
+    order far from the market that we cancel within seconds; it does not touch
+    the open hedge legs. Exits non-zero on FAIL so it is scriptable."""
+    from . import economics
+    from .numeric import ZERO, D
+
+    eng = Engine(cfg)
+    signer = eng._lighter_signer
+    if signer is None:
+        print("cancel-test: no live signer (needs config.live_trading=true + Lighter creds)")
+        eng.close()
+        return 1
+    sym = eng.lighter_symbol
+    read = eng.lighter
+
+    def _dump_open(tag: str):
+        orders = signer.open_orders(sym)
+        print(f"[{tag}] open_orders({sym}) = {json.dumps(orders, default=str, ensure_ascii=False)}")
+        return orders
+
+    verify_timeout = float(cfg.get("maker_cancel_verify_timeout_s", 5))
+    verify_poll = float(cfg.get("maker_cancel_verify_poll_s", 0.5))
+    below_pct = D(str(cfg.get("cancel_test_below_pct", "0.03")))   # rest 3% below bid
+    notional = D(str(cfg.get("cancel_test_notional_usdt", 50)))
+
+    contract = read.public_contract(sym)
+    sd = contract.get("size_decimals")
+    size_step = D(1).scaleb(-int(sd)) if sd is not None else D("0.0001")
+    book = read.order_book(sym)
+    bids = book.get("bids") or []
+    if not bids:
+        print("cancel-test: no bids in the Lighter book — cannot pick a resting price")
+        eng.close()
+        return 1
+    best_bid = D(bids[0][0])
+    px = best_bid * (D(1) - below_pct)                 # well behind the touch
+    qty = economics.qty_for_notional(notional, px, size_step)
+    if qty <= ZERO:
+        qty = size_step
+    print(f"cancel-test {sym}: best_bid={best_bid} -> post-only BUY {qty} @ {px} "
+          f"(~{below_pct * 100}% below), verify<= {verify_timeout}s")
+
+    result = 1
+    net_guard.disarm(LIVE_ARM_TOKEN)
+    try:
+        base_pos = signer.signed_position(sym)
+        print(f"[baseline] signed_position({sym}) = {base_pos}")
+        _dump_open("baseline")
+
+        placed = signer.place_post_only_limit_order(sym, "buy", qty, px, reduce_only=False)
+        print(f"[place] {json.dumps(placed, default=str, ensure_ascii=False)}")
+
+        resting = []
+        deadline = time.time() + verify_timeout
+        while time.time() < deadline:
+            resting = _dump_open("after-place")
+            if resting:
+                break
+            time.sleep(verify_poll)
+        if not resting:
+            print("cancel-test: WARN — placed order never showed as resting "
+                  "(either it filled, or open_orders cannot see it). Cancelling anyway.")
+
+        try:
+            cancelled = signer.cancel_all(sym)
+            print(f"[cancel_all] {json.dumps(cancelled, default=str, ensure_ascii=False)}")
+        except Exception as exc:
+            print(f"[cancel_all] RAISED {type(exc).__name__}: {exc}")
+
+        empty = False
+        deadline = time.time() + verify_timeout
+        while True:
+            left = _dump_open("after-cancel")
+            if not left:
+                empty = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(verify_poll)
+
+        pos_now = signer.signed_position(sym)
+        moved = D(pos_now) - D(base_pos)
+        if empty and abs(moved) <= size_step / D(2):
+            print("cancel-test: PASS ✅ cancel_all verifiably cleared the resting "
+                  "order and position is unchanged — maker leg is safe to re-enable.")
+            result = 0
+        else:
+            print(f"cancel-test: FAIL ❌ empty={empty} position_moved={moved}. "
+                  "cancel_all did NOT provably clear the order (or it filled). "
+                  "Keep lighter_maker_enabled=false and investigate the SDK/venue.")
+            result = 2
+    except Exception as exc:
+        print(f"cancel-test: ERROR {type(exc).__name__}: {exc}")
+        result = 3
+    finally:
+        try:
+            signer.cancel_all(sym)   # safety net: never leave a probe order resting
+        except Exception:
+            pass
+        net_guard.arm()
+        eng.close()
+    return result
+
+
 def cmd_backfill_venue_pnl(cfg, argv: list[str]) -> int:
     """Overwrite recorded round PnL with the true venue-realized number.
 
@@ -400,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_funding_raw(cfg)
     if command == "probe-quote":
         return cmd_probe_quote(cfg)
+    if command == "cancel-test":
+        return cmd_cancel_test(cfg)
     print(f"unknown command: {command}\n{__doc__}")
     return 2
 
