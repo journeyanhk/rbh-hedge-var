@@ -76,19 +76,48 @@ def _num(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def _effective_pnl(r: dict[str, Any]) -> float:
+    """Truth-preferring round PnL. A ``venue_realized`` override (backfilled from
+    the exchange statements) wins over the recorded model ``pnl`` — that is how
+    the panel stops showing the #5 NFP phantom (+4.24 model vs -1.34 real)."""
+    if r.get("venue_realized") is not None:
+        return _num(r.get("venue_realized"))
+    return _num(r.get("pnl"))
+
+
+def _is_estimated(r: dict[str, Any]) -> bool:
+    """A LIVE round whose PnL is still a model/mixed estimate with no venue
+    override — its number is not yet reconciled against the exchange."""
+    if r.get("venue_realized") is not None:
+        return False
+    if r.get("shadow", True):
+        return False
+    return _reason_str(r.get("price_pnl_source")) in ("model", "mixed")
+
+
+def _reason_str(x: Any) -> str:
+    return str(x) if x is not None else ""
+
+
 def aggregate_rounds(state_file: str) -> dict[str, Any]:
     """Server-side aggregation of the shadow ledger (tolerant of missing fields).
 
     New/old records mix freely because every access is a .get(); once the
     data-layer enrichment lands, richer fields simply appear here without a
-    schema migration."""
+    schema migration.
+
+    desgin8: totals prefer ``venue_realized`` when present so the panel reflects
+    the real exchange PnL, and we surface how much of the total is still an
+    unreconciled model estimate (``cum_estimated_pnl`` / ``estimated_rounds``)."""
     rows = _read_rounds(state_file)
     n = len(rows)
-    wins = sum(1 for r in rows if _num(r.get("pnl")) > 0)
-    losses = sum(1 for r in rows if _num(r.get("pnl")) < 0)
-    cum_pnl = sum(_num(r.get("pnl")) for r in rows)
+    wins = sum(1 for r in rows if _effective_pnl(r) > 0)
+    losses = sum(1 for r in rows if _effective_pnl(r) < 0)
+    cum_pnl = sum(_effective_pnl(r) for r in rows)
     cum_price = sum(_num(r.get("price_pnl")) for r in rows)
     cum_funding = sum(_num(r.get("funding_pnl")) for r in rows)
+    estimated_rows = [r for r in rows if _is_estimated(r)]
+    cum_estimated = sum(_effective_pnl(r) for r in estimated_rows)
 
     holds = [
         _num(r.get("closed_at")) - _num(r.get("opened_at"))
@@ -106,7 +135,7 @@ def aggregate_rounds(state_file: str) -> dict[str, Any]:
     series: list[float] = []
     run = 0.0
     for r in rows:
-        run += _num(r.get("pnl"))
+        run += _effective_pnl(r)
         series.append(round(run, 4))
 
     last20 = [
@@ -120,7 +149,10 @@ def aggregate_rounds(state_file: str) -> dict[str, Any]:
             "reason": r.get("reason"),
             "price_pnl": _num(r.get("price_pnl")),
             "funding_pnl": _num(r.get("funding_pnl")),
-            "pnl": _num(r.get("pnl")),
+            "pnl": _effective_pnl(r),
+            "venue_realized": (None if r.get("venue_realized") is None
+                               else _num(r.get("venue_realized"))),
+            "estimated": _is_estimated(r),
             "shadow": bool(r.get("shadow", True)),
         }
         for r in rows[-20:]
@@ -135,6 +167,8 @@ def aggregate_rounds(state_file: str) -> dict[str, Any]:
         "cum_pnl": round(cum_pnl, 4),
         "cum_price_pnl": round(cum_price, 4),
         "cum_funding_pnl": round(cum_funding, 4),
+        "cum_estimated_pnl": round(cum_estimated, 4),
+        "estimated_rounds": len(estimated_rows),
         "avg_hold_s": avg_hold_s,
         "reasons": reasons,
         "series": series,
@@ -204,6 +238,9 @@ canvas{width:100%;height:120px;display:block;margin:6px 0 10px}
 .tbl th:first-child,.tbl td:first-child{text-align:left}
 .tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .foot{color:var(--muted);font-size:12px;text-align:center;margin-top:6px}
+.v.warn{color:var(--warn)}
+.est{color:var(--warn);font-size:10px;font-weight:700;border:1px solid var(--warn);border-radius:4px;padding:0 3px;margin-left:3px}
+.ver{color:var(--ok);font-size:10px;font-weight:700;border:1px solid var(--ok);border-radius:4px;padding:0 3px;margin-left:3px}
 .empty{color:var(--muted);font-size:13px}
 </style></head><body><div class=wrap>
 <header><h1>对冲监控 · XAU</h1><span id=trade class="badge shadow">影子</span></header>
@@ -331,6 +368,7 @@ function renderRounds(a){
   ['价差盈亏',fx(a.cum_price_pnl)+'U',sgn(a.cum_price_pnl)],
   ['资金费盈亏',fx(a.cum_funding_pnl)+'U',sgn(a.cum_funding_pnl)],
   ['平均持仓',dur(a.avg_hold_s),'']];
+ if(a.estimated_rounds>0){S.push(['未对账(估算)',fx(a.cum_estimated_pnl)+'U · '+a.estimated_rounds+'笔','warn']);}
  document.getElementById('stats').innerHTML=S.map(function(r){
   return '<div class=stat><div class=k>'+r[0]+'</div><div class="v '+r[2]+'">'+r[1]+'</div></div>';}).join('');
  drawChart(a.series);
@@ -341,12 +379,13 @@ function renderRounds(a){
  var rows=a.last20||[];var dmap={short_var_long_lighter:'空V多L',short_lighter_long_var:'空L多V'};
  var html='<tr><th>#</th><th>方向</th><th>开仓</th><th>持仓</th><th>原因</th><th>价差</th><th>资金费</th><th>盈亏</th></tr>';
  if(!rows.length){html+='<tr><td colspan=8 class=empty>暂无已平仓回合</td></tr>';}
- rows.forEach(function(r){html+='<tr><td>'+(r.round_id==null?'-':r.round_id)+'</td>'+
+ rows.forEach(function(r){var pnlTxt=fx(r.pnl)+(r.estimated?' <span class=est title="模型估算，未与交易所对账">估</span>':(r.venue_realized!=null?' <span class=ver title="已按交易所流水对账">真</span>':''));
+  html+='<tr><td>'+(r.round_id==null?'-':r.round_id)+'</td>'+
   '<td>'+(dmap[r.direction]||r.direction||'-')+'</td><td>'+tm(r.opened_at)+'</td><td>'+dur(r.hold_s)+'</td>'+
   '<td>'+(rmap[_bucket(r.reason)]||_bucket(r.reason))+'</td>'+
   '<td class="'+sgn(r.price_pnl)+'">'+fx(r.price_pnl)+'</td>'+
   '<td class="'+sgn(r.funding_pnl)+'">'+fx(r.funding_pnl)+'</td>'+
-  '<td class="'+sgn(r.pnl)+'">'+fx(r.pnl)+'</td></tr>';});
+  '<td class="'+sgn(r.pnl)+'">'+pnlTxt+'</td></tr>';});
  document.getElementById('tbl').innerHTML=html;
 }
 function _bucket(r){if(!r)return 'unknown';return String(r).split(/[ :]/)[0]||'unknown';}

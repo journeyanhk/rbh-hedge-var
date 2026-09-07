@@ -182,3 +182,42 @@ def test_finish_exit_records_audit_extra_and_drops_none(tmp_path):
     sm2.begin_exit("r")
     sm2.finish_exit(2.0, 0.0, "r", cooldown_s=1, extra={"pnl": 999.0})
     assert sm2.state["round_history"][-1]["pnl"] == 2.0
+
+
+def test_rollback_entry_to_cooldown_from_entering(tmp_path):
+    # desgin8: a cleanly rolled-back partial entry sits out a cooldown instead of
+    # latching a HALT. ENTERING -> COOLDOWN is now a legal transition.
+    sm = _sm(tmp_path)
+    sm.begin_entry("short_var_long_lighter", "signal")
+    assert sm.mode == ENTERING
+    sm.rollback_entry_to_cooldown("NakedLegError", cooldown_s=1800)
+    assert sm.mode == COOLDOWN
+    assert not sm.is_halted()
+    assert sm.state["direction"] is None and sm.state["legs"] == []
+    assert sm.state["cooldown_until"] > int(time.time())
+    # no round was booked (nothing net traded)
+    assert not sm.state.get("round_history")
+
+
+def test_backfill_venue_realized_patches_ledger_and_history(tmp_path):
+    import json
+    sm = _sm(tmp_path)
+    # book two closed rounds
+    for i, pnl in enumerate([4.24, -0.51], start=1):
+        sm.begin_entry("short_var_long_lighter", "s")
+        sm.confirm_hold([{"venue": "variational", "side": "sell", "qty": "1", "price": "4300"}])
+        sm.begin_exit("tp")
+        sm.finish_exit(pnl, 0.0, "take_profit", cooldown_s=0)
+        sm.force_leave_cooldown()
+    rid = sm.state["round_history"][0]["round_id"]
+    res = sm.backfill_venue_realized({rid: -1.34})
+    # history patched
+    assert sm.state["round_history"][0]["venue_realized"] == -1.34
+    # original pnl preserved for audit
+    assert sm.state["round_history"][0]["pnl"] == 4.24
+    # ledger patched on disk
+    ledger = (tmp_path / "shadow_rounds.jsonl").read_text().splitlines()
+    recs = [json.loads(x) for x in ledger if x.strip()]
+    hit = next(r for r in recs if r["round_id"] == rid)
+    assert hit["venue_realized"] == -1.34 and hit["pnl"] == 4.24
+    assert res["patched"] and res["patched"][0]["round_id"] == rid

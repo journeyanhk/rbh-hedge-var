@@ -7,6 +7,7 @@ Commands:
   guard-check  print net-guard status (proves writes are blocked)
   clear-halt   clear a latched drawdown HALT and reset PnL counters
   clear-cooldown  end the current COOLDOWN now -> IDLE (skip the remaining wait)
+  backfill-venue-pnl  overwrite recorded round PnL with true venue-realized numbers
   reconcile    (Phase 2) print real signed positions on both venues
   preflight    (Phase 2) go-live readiness table; never disarms/trades
   verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
@@ -262,6 +263,48 @@ def cmd_probe_quote(cfg) -> int:
     return 0
 
 
+def cmd_backfill_venue_pnl(cfg, argv: list[str]) -> int:
+    """Overwrite recorded round PnL with the true venue-realized number.
+
+    Usage:
+      python -m rbh_hedge_var backfill-venue-pnl --set 5=-1.34 [--set 6=-0.51 ...]
+      python -m rbh_hedge_var backfill-venue-pnl --from realized.json  # {"5":-1.34}
+    Run with the service STOPPED so the engine does not clobber the state patch.
+    """
+    from .state_machine import StateMachine
+    mapping: dict[int, float] = {}
+    if "--from" in argv:
+        i = argv.index("--from")
+        path = argv[i + 1] if i + 1 < len(argv) else ""
+        try:
+            raw = json.loads(open(path, encoding="utf-8").read())
+            mapping.update({int(k): float(v) for k, v in raw.items()})
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": f"bad --from file: {exc}"}, indent=2))
+            return 2
+    for i, tok in enumerate(argv):
+        if tok == "--set" and i + 1 < len(argv):
+            pair = argv[i + 1]
+            try:
+                rid, val = pair.split("=", 1)
+                mapping[int(rid)] = float(val)
+            except Exception:
+                print(json.dumps({"ok": False, "error": f"bad --set '{pair}' (want ID=PNL)"}, indent=2))
+                return 2
+    if not mapping:
+        print(json.dumps({"ok": False, "error": "no rounds given; use --set ID=PNL or --from file"},
+                         indent=2))
+        return 2
+    sm = StateMachine(cfg.get("state_file", "state.json"))
+    result = sm.backfill_venue_realized(mapping)
+    result["ok"] = True
+    result["message"] = ("venue_realized written; panel totals now prefer it. "
+                         "Original pnl preserved for audit. Restart the service to "
+                         "reload state.json.")
+    print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    return 0
+
+
 def cmd_run(cfg) -> int:
     eng = Engine(cfg)
     live = _maybe_arm_live(cfg, eng)
@@ -345,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_clear_halt(cfg)
     if command == "clear-cooldown":
         return cmd_clear_cooldown(cfg)
+    if command == "backfill-venue-pnl":
+        return cmd_backfill_venue_pnl(cfg, argv)
     if command == "reconcile":
         return cmd_reconcile(cfg)
     if command == "preflight":

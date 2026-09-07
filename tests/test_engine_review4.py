@@ -168,9 +168,34 @@ def test_do_entry_naked_leg_halts(tmp_path):
 
     eng._live_executor = NakedExec()
     eng._var_gateway = FakeVarGw(D("0"))
+    # desgin8: a naked leg only HALTs when the book is NOT confirmed flat. Leave a
+    # residual Lighter position so the rollback-flat check fails -> hard HALT.
+    eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("2.7")}]}
     snap = {"var_price": D("4330"), "lighter_price": D("4320"),
             "live_allowed_by_units": True, "funding_verified": True}
     action = eng._do_entry("short_var_long_lighter", "t", snap)
     assert action.startswith("entry_naked_leg")
     assert eng.sm.is_halted()
     assert "naked_leg" in (eng.sm.halt_reason() or "")
+
+
+def test_do_entry_rollback_flat_downgrades_to_cooldown(tmp_path):
+    # desgin8 companion: same failed open but the book ends FLAT -> cooldown, no HALT.
+    eng = _engine(tmp_path)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+
+    class NakedExec:
+        def open_hedge(self, *a, **k):
+            from rbh_hedge_var.live_executor import NakedLegError
+            raise NakedLegError("Lighter hedge unconfirmed; flattened Variational leg")
+
+    eng._live_executor = NakedExec()
+    eng._var_gateway = FakeVarGw(D("0"))
+    eng.lighter.account_snapshot = lambda: {"positions": []}
+    snap = {"var_price": D("4330"), "lighter_price": D("4320"),
+            "live_allowed_by_units": True, "funding_verified": True}
+    action = eng._do_entry("short_var_long_lighter", "t", snap)
+    assert action.startswith("entry_rolled_back")
+    assert not eng.sm.is_halted()
+    from rbh_hedge_var.state_machine import COOLDOWN
+    assert eng.sm.mode == COOLDOWN

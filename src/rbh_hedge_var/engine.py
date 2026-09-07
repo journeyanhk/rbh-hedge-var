@@ -514,13 +514,29 @@ class Engine:
                 var_symbol=self.var_symbol, lit_symbol=self.lighter_symbol,
             )
         except NakedLegError as exc:
-            # review4 P0-A/P0-C: a leg may be live and the auto-flatten failed.
-            # Do NOT roll back to IDLE as if nothing happened — latch HALT so a
+            # review4 P0-A/P0-C + desgin8: a partial entry raised. Two very
+            # different outcomes hide behind one exception:
+            #   (a) the stray leg was ROLLED BACK cleanly (Lighter never filled,
+            #       the Variational leg was bought back) — the book is FLAT, no
+            #       residual, nothing net traded. Latching a hard HALT here froze
+            #       the bot for hours after a benign failed open (9/7 incident).
+            #   (b) the rollback may have left a residual — a genuine naked leg.
+            # We do NOT trust the exception text; we READ both venues and only
+            # downgrade to a cooldown when they confirm flat. Anything else HALTs.
+            if live and self._entry_rollback_flat():
+                cd = int(self.cfg.get("failed_open_cooldown_seconds",
+                                      self.cfg.get("close_cooldown_seconds", 1200)))
+                self.sm.rollback_entry_to_cooldown(type(exc).__name__, cd)
+                self._log(f"[{mode_tag} OPEN ROLLED BACK] {exc} -> book flat, cooldown {cd}s")
+                self._alert(f"↩️ {mode_tag} entry rolled back cleanly (both venues flat): {exc}. "
+                            f"Cooling down {cd // 60}min, then resuming — no HALT needed.")
+                return f"entry_rolled_back:{type(exc).__name__}"
+            # Residual may remain (or we could not verify flat) -> latch HALT so a
             # human reconciles the book before any further trading.
             reason = f"naked_leg:{type(exc).__name__}"
             self.sm.set_halt(reason)
-            self._log(f"[{mode_tag} NAKED LEG] {exc} -> HALT")
-            self._alert(f"🛑 HALT: {mode_tag} entry left a naked leg: {exc}. "
+            self._log(f"[{mode_tag} NAKED LEG] {exc} -> HALT (book not confirmed flat)")
+            self._alert(f"🛑 HALT: {mode_tag} entry left a possible naked leg: {exc}. "
                         f"Flatten manually, then `clear-halt`.")
             return f"entry_naked_leg:{type(exc).__name__}"
         except Exception as exc:
@@ -782,6 +798,29 @@ class Engine:
         the gate stays fail-closed exactly as before."""
         att = funding_attest.valid_attestation(self.sm.funding_attestation(), "lighter")
         return int(att["interval_s"]) if att else None
+
+    def _entry_rollback_flat(self) -> bool:
+        """desgin8: after a partial entry was rolled back, confirm BOTH venues are
+        actually flat before downgrading the HALT to a cooldown. Reads real
+        positions (never trusts the exception text or the model). Returns True
+        only when every venue is within half a size step of zero; any residual,
+        read failure, or missing gateway returns False so the caller keeps the
+        safe HALT."""
+        if self._var_gateway is None:
+            return False
+        try:
+            live = reconcile.reconcile_positions(
+                self.lighter_symbol, lighter_read=self.lighter,
+                var_gateway=self._var_gateway, var_symbol=self.var_symbol)
+        except Exception as exc:
+            self._log(f"[ROLLBACK] cannot verify flat after failed open: {exc} -> HALT")
+            return False
+        tol = self._size_step() / 2
+        residual = {k: str(v) for k, v in live.items() if abs(D(v)) > tol}
+        if residual:
+            self._log(f"[ROLLBACK] residual after failed open {residual} -> HALT")
+            return False
+        return True
 
     def _size_step(self) -> Decimal:
         """Lighter base size step from size_decimals; fail-closed tiny fallback."""

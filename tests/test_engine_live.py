@@ -397,3 +397,32 @@ def test_halted_holding_round_still_marks_to_market(tmp_path):
     snap = out["snapshot"]
     # read-only MTM populated the unrealized fields for the dashboard
     assert "unrealized_total_pnl_usdt" in snap or "round_pnl_vs_entry_usdt" in snap
+
+
+# --- desgin8: naked-leg rollback downgrades to cooldown when book is flat ------
+
+def test_failed_open_rolled_back_flat_downgrades_to_cooldown(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    # Lighter ACCEPTS the hedge but it never fills -> NakedLegError after the
+    # Variational leg is flattened back. Both venues end flat.
+    eng._lighter_signer.place_market_order = lambda *a, **k: {"client_order_index": 1, "tx_hash": "0x"}
+    eng.lighter.account_snapshot = lambda: {"positions": []}  # flat after rollback
+    sent = _capture_alerts(eng)
+    action = eng._do_entry("short_var_long_lighter", "t", _snap())
+    assert action.startswith("entry_rolled_back")
+    assert eng.sm.mode == SM.COOLDOWN
+    assert not eng.sm.is_halted()
+    assert eng.sm.state.get("cooldown_until", 0) > 0
+    assert any("rolled back" in m.lower() for m in sent)
+
+
+def test_failed_open_with_residual_still_halts(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng._lighter_signer.place_market_order = lambda *a, **k: {"client_order_index": 1, "tx_hash": "0x"}
+    # reconcile sees a LEFTOVER Lighter position -> not flat -> keep the hard HALT
+    eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("2.7")}]}
+    action = eng._do_entry("short_var_long_lighter", "t", _snap())
+    assert action.startswith("entry_naked_leg")
+    assert eng.sm.is_halted()

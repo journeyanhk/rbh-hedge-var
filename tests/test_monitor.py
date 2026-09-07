@@ -78,3 +78,47 @@ def test_reason_bucket_splits_on_space_and_colon():
     assert monitor._reason_bucket("watchdog_naked:something") == "watchdog_naked"
     assert monitor._reason_bucket(None) == "unknown"
     assert monitor._reason_bucket("") == "unknown"
+
+
+def test_venue_realized_override_wins_over_model_pnl(tmp_path):
+    # desgin8: the #5 NFP phantom recorded +4.24 (model); the true venue number
+    # is -1.34. Once venue_realized is backfilled, totals must prefer it.
+    sf = _write_rounds(tmp_path, [
+        {"round_id": 5, "opened_at": 1000, "closed_at": 4600, "reason": "take_profit",
+         "price_pnl": 4.24, "funding_pnl": 0.0, "pnl": 4.24, "shadow": False,
+         "price_pnl_source": "model", "venue_realized": -1.34},
+        {"round_id": 6, "opened_at": 5000, "closed_at": 5900, "reason": "take_profit",
+         "price_pnl": -0.51, "funding_pnl": 0.0, "pnl": -0.51, "shadow": False,
+         "price_pnl_source": "venue_order"},
+    ])
+    a = monitor.aggregate_rounds(sf)
+    # cum uses -1.34 (override) + -0.51 = -1.85, NOT +4.24 - 0.51
+    assert abs(a["cum_pnl"] - (-1.85)) < 1e-9
+    assert a["wins"] == 0 and a["losses"] == 2
+    # round 5 is now verified (override present) -> not estimated
+    assert a["estimated_rounds"] == 0
+    r5 = next(r for r in a["last20"] if r["round_id"] == 5)
+    assert r5["pnl"] == -1.34 and r5["venue_realized"] == -1.34
+    assert r5["estimated"] is False
+
+
+def test_estimated_live_model_round_flagged_and_bucketed(tmp_path):
+    # a LIVE model-priced round with no override is an unreconciled estimate
+    sf = _write_rounds(tmp_path, [
+        {"round_id": 7, "opened_at": 1, "closed_at": 2, "reason": "take_profit",
+         "price_pnl": 0.3, "funding_pnl": 0.0, "pnl": 0.3, "shadow": False,
+         "price_pnl_source": "model"},
+    ])
+    a = monitor.aggregate_rounds(sf)
+    assert a["estimated_rounds"] == 1
+    assert abs(a["cum_estimated_pnl"] - 0.3) < 1e-9
+    assert a["last20"][0]["estimated"] is True
+
+
+def test_shadow_round_never_estimated(tmp_path):
+    sf = _write_rounds(tmp_path, [
+        {"round_id": 1, "opened_at": 1, "closed_at": 2, "reason": "take_profit",
+         "price_pnl": 0.2, "funding_pnl": 0.0, "pnl": 0.2, "shadow": True},
+    ])
+    a = monitor.aggregate_rounds(sf)
+    assert a["estimated_rounds"] == 0

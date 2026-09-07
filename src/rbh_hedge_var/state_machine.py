@@ -23,7 +23,7 @@ COOLDOWN = "COOLDOWN"
 
 VALID_TRANSITIONS = {
     IDLE: {ENTERING},
-    ENTERING: {HOLDING, EXITING, IDLE},   # IDLE = entry aborted/rolled back
+    ENTERING: {HOLDING, EXITING, IDLE, COOLDOWN},   # IDLE/COOLDOWN = entry aborted/rolled back
     HOLDING: {EXITING},
     EXITING: {COOLDOWN, HOLDING},         # HOLDING = exit aborted (single leg left)
     COOLDOWN: {IDLE},
@@ -141,6 +141,20 @@ class StateMachine:
         self.state["legs"] = []
         self.save()
 
+    def rollback_entry_to_cooldown(self, reason: str, cooldown_s: int) -> None:
+        """desgin8/var-desgin8: a partial entry that was ROLLED BACK cleanly (the
+        stray leg flattened, both venues confirmed flat) is NOT a naked-leg
+        emergency — nothing net was traded and the book is flat. Instead of
+        latching a HALT (which froze the bot for hours after a benign failed
+        open), sit out a normal cooldown then resume. No round PnL is booked
+        because no round completed."""
+        self.transition(COOLDOWN, f"entry_rolled_back:{reason}")
+        self.state["direction"] = None
+        self.state["legs"] = []
+        self.state["reversal_streak"] = 0
+        self.state["cooldown_until"] = int(time.time()) + int(cooldown_s)
+        self.save()
+
     def begin_exit(self, reason: str) -> None:
         self.transition(EXITING, reason)
 
@@ -197,6 +211,51 @@ class StateMachine:
                 fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         except Exception:
             pass  # ledger is best-effort; never block the state machine
+
+    def backfill_venue_realized(self, mapping: dict[int, float]) -> dict[str, Any]:
+        """desgin8: overwrite recorded (often model-estimated) round PnL with the
+        TRUE venue-realized number, reconciled by hand from the exchange
+        statements. Patches BOTH the bounded ``round_history`` in state.json and
+        the append-only ``shadow_rounds.jsonl`` ledger, keyed by ``round_id``.
+        The original ``pnl``/``price_pnl`` fields are preserved untouched; only a
+        ``venue_realized`` override is added, so the audit trail stays intact and
+        the panel prefers the override. Returns a per-round patch summary.
+
+        Only reliable while the service is STOPPED — a running engine rewrites
+        state.json each tick and would clobber the state-side patch."""
+        patched: list[dict[str, Any]] = []
+        # 1) bounded live view in state.json
+        history = list(self.state.get("round_history") or [])
+        for rec in history:
+            rid = rec.get("round_id")
+            if rid in mapping:
+                rec["venue_realized"] = float(mapping[rid])
+        self.state["round_history"] = history
+        self.save()
+        # 2) append-only ledger
+        p = Path(self.path).parent / "shadow_rounds.jsonl"
+        if p.exists():
+            out_lines: list[str] = []
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    out_lines.append(line)   # preserve unparseable lines verbatim
+                    continue
+                rid = rec.get("round_id")
+                if rid in mapping:
+                    before = rec.get("venue_realized")
+                    rec["venue_realized"] = float(mapping[rid])
+                    patched.append({"round_id": rid, "was": rec.get("pnl"),
+                                    "prev_override": before,
+                                    "venue_realized": rec["venue_realized"]})
+                out_lines.append(json.dumps(rec, ensure_ascii=False, default=str))
+            tmp = p.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+            tmp.replace(p)
+        return {"patched": patched, "requested": {str(k): v for k, v in mapping.items()}}
 
     def clamp_cooldown(self, max_seconds: int) -> bool:
         """Shorten an over-long in-progress cooldown to now + max_seconds.
