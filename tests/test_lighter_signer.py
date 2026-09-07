@@ -16,14 +16,20 @@ def teardown_function():
 
 
 class FakeRead:
-    def __init__(self, positions=None):
+    def __init__(self, positions=None, active_orders=None):
         self._positions = positions or []
+        self._active_orders = active_orders
+        self.active_orders_calls = []
 
     def public_contract(self, symbol):
         return {"market_id": 40, "size_decimals": 4, "price_decimals": 2}
 
     def account_snapshot(self):
         return {"positions": self._positions}
+
+    def account_active_orders(self, symbol, *, auth_token=None):
+        self.active_orders_calls.append({"symbol": symbol, "auth_token": auth_token})
+        return list(self._active_orders or [])
 
 
 class FakeSigner:
@@ -124,6 +130,19 @@ def test_auth_token_raises_on_error():
     c = _client(signer=Sig())
     with pytest.raises(LighterSignerError):
         c.auth_token()
+
+
+def test_open_orders_reads_active_orders_with_auth(monkeypatch):
+    # review22: open_orders is a signed READ — it must pass a locally-signed
+    # auth token to the active-orders query and return the resting orders.
+    class Sig:
+        def create_auth_token_with_expiry(self, deadline=-1, *, api_key_index=255):
+            return ("tok:0", None)
+    read = FakeRead(active_orders=[{"order_index": 5, "remaining_base_amount": D("0.5")}])
+    c = _client(read=read, signer=Sig())
+    orders = c.open_orders("XAU")
+    assert orders == [{"order_index": 5, "remaining_base_amount": D("0.5")}]
+    assert read.active_orders_calls == [{"symbol": "XAU", "auth_token": "tok:0"}]
 
 
 def test_signer_construction_adapts_to_sdk_signature(monkeypatch):

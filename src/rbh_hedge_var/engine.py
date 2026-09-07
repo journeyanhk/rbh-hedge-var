@@ -825,6 +825,21 @@ class Engine:
         if residual:
             self._log(f"[ROLLBACK] residual after failed open {residual} -> HALT")
             return False
+        # review22: positions can read flat while a maker post-only order is
+        # still RESTING on Lighter (a "zombie"). If it fills a moment later it
+        # becomes a naked double-hedge — exactly the 13:09 event. So a rollback
+        # is only safe when the order book is provably empty too. A missing
+        # signer, a query failure, or any resting order forces the safe HALT.
+        signer = self._lighter_signer
+        if signer is not None and hasattr(signer, "open_orders"):
+            try:
+                orders = signer.open_orders(self.lighter_symbol)
+            except Exception as exc:
+                self._log(f"[ROLLBACK] cannot verify Lighter order book after failed open: {exc} -> HALT")
+                return False
+            if orders:
+                self._log(f"[ROLLBACK] {len(orders)} resting Lighter order(s) after failed open -> HALT")
+                return False
         return True
 
     def _size_step(self) -> Decimal:

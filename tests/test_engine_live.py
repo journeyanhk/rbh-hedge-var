@@ -428,6 +428,21 @@ def test_failed_open_with_residual_still_halts(tmp_path):
     assert eng.sm.is_halted()
 
 
+def test_failed_open_zombie_resting_order_forces_halt(tmp_path):
+    # review22: positions read FLAT after rollback, but a maker post-only order is
+    # still RESTING on Lighter (a "zombie"). It could fill later into a double
+    # hedge, so the rollback must NOT downgrade to cooldown — it forces the HALT.
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng._lighter_signer.place_market_order = lambda *a, **k: {"client_order_index": 1, "tx_hash": "0x"}
+    eng.lighter.account_snapshot = lambda: {"positions": []}          # flat position
+    eng._lighter_signer.open_orders = lambda sym: [{"order_index": 7}]  # but a zombie rests
+    action = eng._do_entry("short_var_long_lighter", "t", _snap())
+    assert action.startswith("entry_naked_leg")
+    assert eng.sm.is_halted()
+    assert eng.sm.mode != SM.COOLDOWN
+
+
 def _exit_urgent_flag(tmp_path, reason):
     """Drive a live exit with ``reason`` and capture the urgent flag passed to
     close_hedge — the maker-vs-taker classification (desgin7/8 route ①). Each

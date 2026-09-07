@@ -19,7 +19,9 @@ from rbh_hedge_var.shadow_executor import ShadowExecutor
 CFG = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text())
 # make the confirmation loop instant in tests (incl. the maker patience window)
 CFG = {**CFG, "fill_confirm_timeout_s": 1, "fill_confirm_poll_s": 0,
-       "maker_fill_timeout_s": 0, "maker_max_requotes": 2}
+       "lighter_maker_enabled": True,
+       "maker_fill_timeout_s": 0, "maker_max_requotes": 2,
+       "maker_cancel_verify_timeout_s": 0, "maker_cancel_verify_poll_s": 0}
 
 
 def setup_function():
@@ -263,7 +265,7 @@ class MakerLighter:
     and the drift-abort fires."""
 
     def __init__(self, maker_fill_fraction=D("1"), entry="4320", fresh_book=None,
-                 post_only_exc=None):
+                 post_only_exc=None, cancel_leaves_zombie=False):
         self.calls = []          # taker
         self.maker_calls = []    # post-only
         self.cancels = []
@@ -272,14 +274,23 @@ class MakerLighter:
         self.maker_fill_fraction = D(maker_fill_fraction)
         self.post_only_exc = post_only_exc
         self.read = _FakeRead(fresh_book) if fresh_book is not None else None
+        # review22: an unfilled maker remainder RESTS on the book until cancelled;
+        # cancel_leaves_zombie models the 13:09 bug where a cancel silently failed
+        # and left the resting order to fill later into a double hedge.
+        self.resting = []
+        self.cancel_leaves_zombie = cancel_leaves_zombie
 
     def place_post_only_limit_order(self, symbol, side, qty, limit_price, reduce_only=False):
         if self.post_only_exc is not None:
             raise self.post_only_exc
         filled = D(qty) * self.maker_fill_fraction
+        unfilled = D(qty) - filled
         self.maker_calls.append({"symbol": symbol, "side": side, "qty": D(qty),
                                  "price": D(limit_price), "reduce_only": reduce_only})
         self.pos += filled if side == "buy" else -filled
+        if unfilled > ZERO:
+            self.resting.append({"symbol": symbol, "side": side,
+                                 "remaining_base_amount": unfilled})
         return {"post_only": True, "order_index": 1, "tx_hash": "0xpo"}
 
     def place_market_order(self, symbol, side, qty, ref_price, reduce_only=False,
@@ -291,7 +302,12 @@ class MakerLighter:
 
     def cancel_all(self, symbol=None):
         self.cancels.append(symbol)
+        if not self.cancel_leaves_zombie:
+            self.resting = [o for o in self.resting if symbol and o["symbol"] != symbol]
         return {"cancelled": True}
+
+    def open_orders(self, symbol):
+        return [o for o in self.resting if o["symbol"] == symbol]
 
     def signed_position(self, symbol="XAU"):
         return self.pos
@@ -424,3 +440,49 @@ def test_maker_aborts_on_price_drift_and_takers():
     assert out["both_filled"] is True
     assert lit.maker_calls == []                 # drift aborted before any quote
     assert lit.calls and lit.calls[0]["side"] == "buy"   # taker hedged instead
+
+
+# ---- review22 verified-cancel / zombie order --------------------------------
+def test_maker_verified_cancel_clears_book_then_taker_sweeps():
+    # a normal cancel provably empties the book, so the taker sweep proceeds and
+    # entry succeeds with nothing left resting.
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("0"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls and lit.calls         # maker attempted, taker swept
+    assert lit.cancels                           # cancel was issued
+    assert lit.open_orders("XAU") == []          # book proven clear at the end
+
+
+def test_maker_zombie_cancel_failure_raises_naked_leg_no_double_hedge():
+    # review22 CORE: cancel silently fails -> a maker remainder stays RESTING.
+    # verified-cancel must refuse to taker-sweep (no double hedge) and the open
+    # rolls back the Variational leg with a NakedLegError instead of HOLDING.
+    var = FakeVar()
+    lit = MakerLighter(maker_fill_fraction=D("0.5"), cancel_leaves_zombie=True)
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(NakedLegError):
+        ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                      D("0.0001"), _BOOK)
+    # no taker sweep happened (would have doubled the hedge)
+    assert lit.calls == []
+    # Variational leg was flattened back to flat — nothing left naked on Var
+    assert var.pos == ZERO
+
+
+def test_open_residual_resting_order_blocks_holding():
+    # review22 ④ belt-and-suspenders: even on the taker path, a lingering resting
+    # order must block entry into HOLDING (it could fill later into a double hedge).
+    cfg = {**CFG, "lighter_maker_enabled": False}
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("1"))
+    lit.resting.append({"symbol": "XAU", "side": "buy",
+                        "remaining_base_amount": D("0.5")})
+    ex = LiveExecutor(cfg, lighter_signer=lit, var_gateway=var)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(NakedLegError):
+        ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                      D("0.0001"), _BOOK)

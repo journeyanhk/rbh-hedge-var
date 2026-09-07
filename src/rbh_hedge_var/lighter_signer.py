@@ -295,6 +295,17 @@ class LighterSignerClient:
                 "market_index": market_index}
 
     # ---- reconciliation (read-only) ---------------------------------------
+    def open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """Currently RESTING orders for this account on ``symbol`` (review22).
+
+        The write-guard does not apply — this is a signed READ (auth token
+        produced locally, no mutation). Feeds the executor's verified-cancel:
+        after a maker cancel we confirm this returns empty before permitting a
+        taker sweep, so a silently-failed cancel can never leave a zombie order
+        that later fills into a double hedge. Fails closed (raises) if the token
+        or query fails, so the caller treats 'cannot verify' as 'not cancelled'."""
+        return self.read.account_active_orders(symbol, auth_token=self.auth_token())
+
     def signed_position(self, symbol: str) -> Decimal:
         """Signed base qty for one symbol (>0 long, <0 short, 0 flat)."""
         snap = self.read.account_snapshot()

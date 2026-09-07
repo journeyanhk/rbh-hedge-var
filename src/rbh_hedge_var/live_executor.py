@@ -46,6 +46,14 @@ class NakedLegError(LiveExecutionError):
     residual position. The engine treats this as a HALT-worthy emergency."""
 
 
+class MakerCancelError(LiveExecutionError):
+    """Raised when a resting maker order could NOT be verified as cancelled
+    (review22). A silently-failed cancel leaves a 'zombie' post-only that fills
+    later into a DOUBLE hedge, so this must NEVER be swallowed and must NEVER be
+    followed by a taker sweep — the caller flattens what it can and escalates to
+    the naked-leg/HALT chain so a human reconciles the book."""
+
+
 class LiveExecutor:
     def __init__(self, cfg: dict[str, Any], *, lighter_signer: Any, var_gateway: Any) -> None:
         if lighter_signer is None or var_gateway is None:
@@ -71,6 +79,12 @@ class LiveExecutor:
         # the reference price — so the maker patience window can never bleed into
         # a large adverse move while a leg waits.
         self.maker_price_drift_abort_pct = D(cfg.get("maker_price_drift_abort_pct", 0.001))
+        # review22: verified-cancel. A maker cancel is a LOAD-BEARING wall (its
+        # failure = double hedge), so after cancelling we POLL the live open
+        # orders until the book proves empty; failure to prove empty within this
+        # window is treated as 'not cancelled' and escalates (never taker-swept).
+        self.maker_cancel_verify_timeout_s = float(cfg.get("maker_cancel_verify_timeout_s", 5))
+        self.maker_cancel_verify_poll_s = float(cfg.get("maker_cancel_verify_poll_s", 0.5))
 
     def _guard(self) -> None:
         if net_guard.is_armed():
@@ -130,11 +144,46 @@ class LiveExecutor:
         return D(ref_price) - nudge if side == "buy" else D(ref_price) + nudge
 
     def _safe_cancel(self, symbol: str) -> None:
-        """Best-effort pull of any resting maker quote before re-quoting."""
+        """Best-effort pull of a REJECTED (never-rested) quote before re-quoting.
+        Only used on the would-cross path where post-only was refused, so there
+        is nothing resting to leak — the load-bearing path uses _cancel_verified."""
         try:
             self.lighter.cancel_all(symbol)
         except Exception:
             pass
+
+    def _open_orders(self, symbol: str) -> list[Any] | None:
+        """Live resting orders for ``symbol``, or None when the venue cannot be
+        queried (no read client / query raised). None means 'cannot verify' and
+        is treated as failure by the caller — never as 'no orders'."""
+        getter = getattr(self.lighter, "open_orders", None)
+        if getter is None:
+            return None
+        try:
+            return getter(symbol)
+        except Exception:
+            return None
+
+    def _cancel_verified(self, symbol: str) -> bool:
+        """Cancel resting orders and PROVE the book is empty (review22). Returns
+        True only when a live query confirms no open orders remain within the
+        verify window. A cancel that raises is NOT swallowed silently — we still
+        fall through to the verification poll and return False unless the book is
+        provably clear. A missing/failing query (None) fails closed to False."""
+        try:
+            self.lighter.cancel_all(symbol)
+        except Exception:
+            pass   # not a silent success: verification below decides the result
+        deadline = time.time() + self.maker_cancel_verify_timeout_s
+        while True:
+            orders = self._open_orders(symbol)
+            if orders is None:
+                return False              # cannot verify -> fail closed
+            if not orders:
+                return True               # proven empty
+            if time.time() >= deadline:
+                return False              # zombie still resting
+            time.sleep(self.maker_cancel_verify_poll_s)
 
     def _fresh_book(self, symbol: str) -> dict[str, list[tuple[Decimal, Decimal]]] | None:
         """Re-read the live Lighter book for a re-quote (P1-B). The engine's
@@ -202,7 +251,13 @@ class LiveExecutor:
                 continue
             self._confirm_delta("lighter", lit_symbol, baseline, sign, lit_size_step,
                                 full_target=target_qty, timeout=self.maker_fill_timeout_s)
-            self._safe_cancel(lit_symbol)       # pull the unfilled remainder
+            # review22: pull the unfilled remainder with a VERIFIED cancel. If we
+            # cannot PROVE the resting order is gone, a taker sweep would double
+            # the hedge — so escalate instead of continuing.
+            if not self._cancel_verified(lit_symbol):
+                raise MakerCancelError(
+                    f"could not verify Lighter maker order cancelled for {lit_symbol} "
+                    f"— possible zombie order; refusing to taker-sweep")
         return self._signed("lighter", lit_symbol) - baseline
 
     def _hedge_lighter(self, lit_symbol: str, side: str, target_qty: Decimal,
@@ -287,6 +342,16 @@ class LiveExecutor:
         if abs(actual_var_qty - actual_lit_qty) > abs(lit_size_step) / D(2):
             raise NakedLegError(
                 f"legs imbalanced after fill var={actual_var_qty} lit={actual_lit_qty}")
+        # review22 ④: belt-and-suspenders — never enter HOLDING with a resting
+        # Lighter order still on the book. Even if every cancel reported success,
+        # PROVE the book is clear; a lingering post-only would fill later into a
+        # double hedge. A None result (query unavailable) is skipped — the maker
+        # path's verified-cancel already gates the load-bearing case.
+        residual_orders = self._open_orders(lit_symbol)
+        if residual_orders:
+            raise NakedLegError(
+                f"residual resting Lighter order(s) after open ({len(residual_orders)}) — "
+                f"refusing to enter HOLDING with a possible zombie order")
         return {"shadow": False, "direction": direction, "legs": legs,
                 "both_filled": True, "opened_at": int(time.time())}
 

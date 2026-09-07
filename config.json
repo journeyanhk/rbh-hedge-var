@@ -91,11 +91,15 @@
   "fill_confirm_poll_s": 2,
 
   "//lighter_maker": "desgin7/8 route ①: work the deep Lighter leg PASSIVELY with post-only limit orders for the maker rebate (~-0.22 -> ~-0.10/-0.13 wear per round). Entry ALWAYS taker-sweeps any unfilled remainder (never leaves a naked leg); only calm exits (take-profit/reversal/max-hold) use maker, urgent exits keep IOC.",
-  "lighter_maker_enabled": true,
+  "//lighter_maker_disabled": "review22: kept OFF (IOC only) until cancel_all is empirically PROVEN to clear resting post-only orders on the live venue. The 13:09 double-hedge was a zombie order that survived a silently-swallowed cancel. Re-enable ONLY after a server-side cancel test passes.",
+  "lighter_maker_enabled": false,
   "maker_fill_timeout_s": 45,
   "maker_max_requotes": 2,
   "maker_fallback_offset_pct": 0.0002,
   "maker_price_drift_abort_pct": 0.001,
+  "//maker_cancel_verify": "review22: after cancelling a resting maker order, POLL live open orders until proven empty (never trust cancel_all's return). timeout_s is the hard budget; poll_s is the gap between reads. A cancel that cannot be proven empty fails closed (no taker-sweep, HALT on rollback).",
+  "maker_cancel_verify_timeout_s": 5,
+  "maker_cancel_verify_poll_s": 0.5,
 
   "//live_reconcile": "review4 P0-C/P1-1: IDLE flat-check cadence (every N ticks while live) and how many CONSECUTIVE reconcile failures before a HOLDING round forces a protective exit.",
   "idle_reconcile_every_ticks": 20,

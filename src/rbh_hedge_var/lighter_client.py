@@ -257,6 +257,55 @@ class LighterReadOnlyClient:
                 f"positionFunding failed (HTTP {res.status}, code {code}): {msg}")
         return body
 
+    # ---- private active-orders read (review22 zombie-order verification) ----
+    def account_active_orders(self, symbol: str, *,
+                              auth_token: str | None = None) -> list[dict[str, Any]]:
+        """Currently RESTING (open, not-yet-filled) orders for this account on
+        ``symbol``'s market. This is the read half of verified-cancel: after a
+        maker cancel we poll this to PROVE the book carries no lingering order
+        before allowing a taker sweep (review22 — a cancel that silently failed
+        left a 'zombie' post-only that later filled into a double hedge).
+
+        Endpoint: ``GET /api/v1/accountActiveOrders`` (account_index + market_id;
+        ``authorization`` header from ``LighterSignerClient.auth_token()``).
+        Fails closed: raises on a transport error OR an error-coded response, so
+        a query that did NOT actually run can never be misread as 'no open
+        orders' (which would wrongly green-light a taker sweep)."""
+        if self.account_index is None:
+            raise LighterError("account_index required for active orders")
+        row = self._market_row(symbol)
+        params: dict[str, Any] = {
+            "account_index": int(self.account_index),
+            "market_id": int(row["market_id"]),
+        }
+        headers = {"authorization": auth_token} if auth_token else None
+        from urllib.parse import urlencode
+        url = self.base_url + "/api/v1/accountActiveOrders?" + urlencode(params)
+        res = http_util.request_json("GET", url, headers=headers, impersonate=True)
+        body = res.json if isinstance(res.json, dict) else {}
+        code = body.get("code")
+        if res.status >= 400 or (code is not None and int(code) != 200):
+            msg = body.get("message") or (res.text or "")[:200]
+            raise LighterError(
+                f"accountActiveOrders failed (HTTP {res.status}, code {code}): {msg}")
+        raw = body.get("orders")
+        if not isinstance(raw, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            out.append({
+                "order_index": r.get("order_index"),
+                "client_order_id": r.get("client_order_id"),
+                "price": D(r.get("price")) if r.get("price") is not None else None,
+                "remaining_base_amount": (D(r.get("remaining_base_amount"))
+                                          if r.get("remaining_base_amount") is not None else None),
+                "is_ask": r.get("is_ask"),
+                "status": r.get("status"),
+            })
+        return out
+
     # ---- write surface (blocked in Phase 1) --------------------------------
     def place_market_order(self, *args: Any, **kwargs: Any):
         raise LighterError("Phase 1 read-only client cannot place orders (Phase 2 feature)")
