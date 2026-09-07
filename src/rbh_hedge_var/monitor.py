@@ -86,13 +86,18 @@ def _effective_pnl(r: dict[str, Any]) -> float:
 
 
 def _is_estimated(r: dict[str, Any]) -> bool:
-    """A LIVE round whose PnL is still a model/mixed estimate with no venue
-    override — its number is not yet reconciled against the exchange."""
+    """A LIVE round whose PnL is not proven against the exchange — a model/mixed
+    estimate, OR (review20 tail ①) a legacy round with NO provenance at all.
+
+    A missing ``price_pnl_source`` used to fall through as "verified", which is
+    backwards: the pre-review18 rounds (#2-#6) are the LEAST trustworthy yet were
+    shown as real. Suspicious-first — a live round with neither a
+    ``venue_realized`` override nor a ``venue_order`` source is an estimate."""
     if r.get("venue_realized") is not None:
         return False
     if r.get("shadow", True):
         return False
-    return _reason_str(r.get("price_pnl_source")) in ("model", "mixed")
+    return _reason_str(r.get("price_pnl_source")) != "venue_order"
 
 
 def _reason_str(x: Any) -> str:

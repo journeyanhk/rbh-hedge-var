@@ -122,3 +122,27 @@ def test_shadow_round_never_estimated(tmp_path):
     ])
     a = monitor.aggregate_rounds(sf)
     assert a["estimated_rounds"] == 0
+
+
+def test_legacy_live_round_without_provenance_is_estimated(tmp_path):
+    # review20 tail (1): a pre-review18 LIVE round has no price_pnl_source at all.
+    # It must default to ESTIMATED (suspicious-first), NOT be shown as verified.
+    sf = _write_rounds(tmp_path, [
+        {"round_id": 3, "opened_at": 1, "closed_at": 2, "reason": "max_hold_elapsed",
+         "price_pnl": -0.28, "funding_pnl": 0.0, "pnl": -0.28, "shadow": False},
+    ])
+    a = monitor.aggregate_rounds(sf)
+    assert a["estimated_rounds"] == 1
+    assert a["last20"][0]["estimated"] is True
+
+
+def test_venue_order_source_is_verified(tmp_path):
+    # a LIVE round booked on the real fill price is NOT an estimate
+    sf = _write_rounds(tmp_path, [
+        {"round_id": 7, "opened_at": 1, "closed_at": 2, "reason": "take_profit",
+         "price_pnl": 0.3, "funding_pnl": 0.0, "pnl": 0.3, "shadow": False,
+         "price_pnl_source": "venue_order"},
+    ])
+    a = monitor.aggregate_rounds(sf)
+    assert a["estimated_rounds"] == 0
+    assert a["last20"][0]["estimated"] is False
