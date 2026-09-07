@@ -426,3 +426,39 @@ def test_failed_open_with_residual_still_halts(tmp_path):
     action = eng._do_entry("short_var_long_lighter", "t", _snap())
     assert action.startswith("entry_naked_leg")
     assert eng.sm.is_halted()
+
+
+def _exit_urgent_flag(tmp_path, reason):
+    """Drive a live exit with ``reason`` and capture the urgent flag passed to
+    close_hedge — the maker-vs-taker classification (desgin7/8 route ①). Each
+    call gets a FRESH state dir so a prior COOLDOWN never blocks the next open."""
+    import uuid
+    sub = tmp_path / uuid.uuid4().hex
+    sub.mkdir()
+    eng = _engine(sub, live=True)
+    _open_live_round(eng)
+    captured = {}
+
+    def spy(legs, var_price, lit_price, book, *, urgent=True):
+        captured["urgent"] = urgent
+        return {"price_pnl": Decimal("0"), "price_pnl_source": "model", "legs": legs}
+
+    eng._live_executor.close_hedge = spy
+    eng._do_exit(reason, _snap())
+    return captured["urgent"]
+
+
+def test_calm_exit_reasons_use_maker(tmp_path):
+    # take-profit / funding reversal / max-hold are time-rich -> maker (urgent=False)
+    assert _exit_urgent_flag(tmp_path, "take_profit 0.9 >= 0.8+0.3 (realizable)") is False
+    assert _exit_urgent_flag(tmp_path, "funding_spread_reversal confirmed x3") is False
+    assert _exit_urgent_flag(tmp_path, "max_hold_elapsed 6.1h >= 6.0h") is False
+
+
+def test_urgent_exit_reasons_keep_taker(tmp_path):
+    # stop-loss / watchdog / drawdown / market-close are urgent -> taker (urgent=True)
+    assert _exit_urgent_flag(tmp_path, "round_stop_loss -2.1 <= -2.0") is True
+    assert _exit_urgent_flag(tmp_path, "watchdog_flatten") is True
+    assert _exit_urgent_flag(tmp_path, "daily_loss_halt") is True
+    assert _exit_urgent_flag(tmp_path, "market_closing") is True
+    assert _exit_urgent_flag(tmp_path, "basis_force_exit 0.05") is True

@@ -645,7 +645,12 @@ class Engine:
         legs = self.sm.state.get("legs") or []
         book = self._safe_book()
         executor = self._executor_for(bool(self.sm.state.get("shadow", True)))
-        result = executor.close_hedge(legs, var_price, lit_price, book)
+        # desgin7/8 route ①: a CALM exit (take-profit / funding reversal /
+        # max-hold) may work the Lighter leg passively for the maker rebate; any
+        # risk-driven exit stays urgent (taker/IOC) for speed. Classify off the
+        # reason string produced by strategy.*_signal.
+        urgent = not reason.startswith(("take_profit", "funding_spread_reversal", "max_hold"))
+        result = executor.close_hedge(legs, var_price, lit_price, book, urgent=urgent)
         price_pnl = float(result.get("price_pnl") or 0)
         funding_pnl = self.sm.funding_accrued()   # P0-1: booked separately
         pnl_source = result.get("price_pnl_source")

@@ -27,14 +27,30 @@ class FakeRead:
 
 
 class FakeSigner:
+    ORDER_TYPE_LIMIT = 0
+    ORDER_TYPE_MARKET = 1
+    ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+    ORDER_TIME_IN_FORCE_POST_ONLY = 2
+    CANCEL_ALL_TIF_IMMEDIATE = 0
+
     def __init__(self):
         self.calls = []
+        self.order_calls = []
+        self.cancel_calls = []
 
     def create_market_order(self, **kw):
         self.calls.append(kw)
         return ({"tx": 1}, "0xabc", None)
 
-    def cancel_all_orders(self):
+    def create_order(self, **kw):
+        self.order_calls.append(kw)
+        import types
+        return (types.SimpleNamespace(order_index=99),
+                types.SimpleNamespace(tx_hash="0xpo"), None)
+
+    def cancel_all_orders(self, time_in_force, timestamp_ms,
+                          cancel_all_market_index=None):
+        self.cancel_calls.append((time_in_force, timestamp_ms, cancel_all_market_index))
         return ({}, "0xdef", None)
 
 
@@ -137,3 +153,52 @@ def test_signer_construction_adapts_to_sdk_signature(monkeypatch):
     assert seen["account_index"] == 7
     assert seen["api_private_keys"] == {3: "pk"}
     assert seen["chain_id"] == 466324
+
+
+def test_post_only_order_blocked_while_armed():
+    c = _client(signer=FakeSigner())
+    with pytest.raises(WriteBlockedError):
+        c.place_post_only_limit_order("XAU", "buy", D("2.7"), D("4320"))
+
+
+def test_post_only_uses_limit_type_and_post_only_tif():
+    signer = FakeSigner()
+    c = _client(signer=signer)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = c.place_post_only_limit_order("XAU", "sell", D("2.7"), D("4321.50"))
+    assert out["post_only"] is True and out["side"] == "sell"
+    assert out["tx_hash"] == "0xpo" and out["order_index"] == 99
+    call = signer.order_calls[0]
+    assert call["order_type"] == FakeSigner.ORDER_TYPE_LIMIT
+    assert call["time_in_force"] == FakeSigner.ORDER_TIME_IN_FORCE_POST_ONLY
+    assert call["is_ask"] is True             # sell
+    # price used EXACTLY (no slippage pad): 4321.50 * 1e2 = 432150
+    assert call["price"] == 432150
+    assert call["base_amount"] == 27000       # 2.7 * 1e4
+
+
+def test_post_only_reject_propagates_as_error():
+    class Rejecting(FakeSigner):
+        def create_order(self, **kw):
+            return (None, None, "post only order would cross")
+    c = _client(signer=Rejecting())
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(LighterSignerError):
+        c.place_post_only_limit_order("XAU", "buy", D("2.7"), D("4319"))
+
+
+def test_cancel_all_scopes_to_market_with_new_signature():
+    signer = FakeSigner()
+    c = _client(signer=signer)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = c.cancel_all("XAU")
+    assert out["cancelled"] is True and out["market_index"] == 40
+    tif, ts, mkt = signer.cancel_calls[0]
+    assert tif == FakeSigner.CANCEL_ALL_TIF_IMMEDIATE
+    assert mkt == 40 and ts > 0
+
+
+def test_cancel_all_blocked_while_armed():
+    c = _client(signer=FakeSigner())
+    with pytest.raises(WriteBlockedError):
+        c.cancel_all("XAU")

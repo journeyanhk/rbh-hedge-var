@@ -90,6 +90,12 @@
   "fill_confirm_timeout_s": 30,
   "fill_confirm_poll_s": 2,
 
+  "//lighter_maker": "desgin7/8 route ①: work the deep Lighter leg PASSIVELY with post-only limit orders for the maker rebate (~-0.22 -> ~-0.10/-0.13 wear per round). Entry ALWAYS taker-sweeps any unfilled remainder (never leaves a naked leg); only calm exits (take-profit/reversal/max-hold) use maker, urgent exits keep IOC.",
+  "lighter_maker_enabled": true,
+  "maker_fill_timeout_s": 45,
+  "maker_max_requotes": 2,
+  "maker_fallback_offset_pct": 0.0002,
+
   "//live_reconcile": "review4 P0-C/P1-1: IDLE flat-check cadence (every N ticks while live) and how many CONSECUTIVE reconcile failures before a HOLDING round forces a protective exit.",
   "idle_reconcile_every_ticks": 20,
   "reconcile_fail_streak": 3,

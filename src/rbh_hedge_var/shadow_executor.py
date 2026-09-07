@@ -102,8 +102,11 @@ class ShadowExecutor:
 
     def close_hedge(self, legs: list[dict[str, Any]],
                     var_price: Decimal, lit_price: Decimal,
-                    lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None) -> dict[str, Any]:
-        # No guard assertion: pure pricing, no network (review13).
+                    lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
+                    *, urgent: bool = True) -> dict[str, Any]:
+        # No guard assertion: pure pricing, no network (review13). ``urgent`` is
+        # accepted for signature parity with LiveExecutor (maker vs taker exit)
+        # but shadow pricing is identical either way.
         # Close the illiquid leg first (Variational RFQ) then Lighter — mirrors
         # the live ordering we will use in Phase 2.
         price_pnl = ZERO

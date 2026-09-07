@@ -17,8 +17,9 @@ from rbh_hedge_var.numeric import ZERO, D
 from rbh_hedge_var.shadow_executor import ShadowExecutor
 
 CFG = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text())
-# make the confirmation loop instant in tests
-CFG = {**CFG, "fill_confirm_timeout_s": 1, "fill_confirm_poll_s": 0}
+# make the confirmation loop instant in tests (incl. the maker patience window)
+CFG = {**CFG, "fill_confirm_timeout_s": 1, "fill_confirm_poll_s": 0,
+       "maker_fill_timeout_s": 0, "maker_max_requotes": 2}
 
 
 def setup_function():
@@ -235,3 +236,131 @@ def test_close_falls_back_to_model_without_venue_price():
     out = ex.close_hedge(legs, D("4331"), D("4322"), None)
     assert out["price_pnl_source"] == "model"
     assert all(leg["exit_source"] == "model" for leg in out["legs"])
+
+
+# ---------------------------------------------------------------------------
+# Lighter MAKER leg (desgin7/8 route ①)
+# ---------------------------------------------------------------------------
+_BOOK = {"bids": [(D("4319"), D("100"))], "asks": [(D("4321"), D("100"))]}
+
+
+class MakerLighter:
+    """Post-only maker fake. A post-only order fills ``maker_fill_fraction`` of
+    the requested qty into self.pos (models a passive fill); a taker fills fully.
+    Records maker/taker/cancel calls so a test can assert which path ran."""
+
+    def __init__(self, maker_fill_fraction=D("1"), entry="4320"):
+        self.calls = []          # taker
+        self.maker_calls = []    # post-only
+        self.cancels = []
+        self.pos = ZERO
+        self.entry = D(entry)
+        self.maker_fill_fraction = D(maker_fill_fraction)
+
+    def place_post_only_limit_order(self, symbol, side, qty, limit_price, reduce_only=False):
+        filled = D(qty) * self.maker_fill_fraction
+        self.maker_calls.append({"symbol": symbol, "side": side, "qty": D(qty),
+                                 "price": D(limit_price), "reduce_only": reduce_only})
+        self.pos += filled if side == "buy" else -filled
+        return {"post_only": True, "order_index": 1, "tx_hash": "0xpo"}
+
+    def place_market_order(self, symbol, side, qty, ref_price, reduce_only=False,
+                           slippage_pct=D("0.002")):
+        self.calls.append({"symbol": symbol, "side": side, "qty": D(qty),
+                           "reduce_only": reduce_only})
+        self.pos += D(qty) if side == "buy" else -D(qty)
+        return {"venue": "lighter", "symbol": symbol, "side": side, "tx_hash": "0xlit"}
+
+    def cancel_all(self, symbol=None):
+        self.cancels.append(symbol)
+        return {"cancelled": True}
+
+    def signed_position(self, symbol="XAU"):
+        return self.pos
+
+    def avg_entry_price(self, symbol="XAU"):
+        return self.entry
+
+
+def test_open_uses_maker_when_book_present():
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("1"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls and lit.maker_calls[0]["side"] == "buy"
+    # buy joins the best bid, never crossing (post-only)
+    assert lit.maker_calls[0]["price"] == D("4319")
+    assert lit.calls == []                      # no taker needed
+    assert abs(var.pos) > ZERO and abs(lit.pos) > ZERO
+
+
+def test_open_taker_sweeps_when_maker_never_fills():
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("0"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls                      # maker was attempted
+    assert lit.calls and lit.calls[0]["side"] == "buy"   # taker swept the hedge
+    # legs balanced within a step -> no naked leg
+    legs = {leg["venue"]: leg for leg in out["legs"]}
+    assert abs(D(legs["lighter"]["qty"]) - D(legs["variational"]["qty"])) <= D("0.0001")
+
+
+def test_open_maker_partial_then_taker_remainder():
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("0.5"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls and lit.calls        # both paths used
+    assert abs(abs(var.pos) - abs(lit.pos)) <= D("0.0001")
+
+
+def test_maker_disabled_uses_taker_only():
+    cfg = {**CFG, "lighter_maker_enabled": False}
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("1"))
+    ex = LiveExecutor(cfg, lighter_signer=lit, var_gateway=var)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls == []                # maker never attempted
+    assert lit.calls and lit.calls[0]["side"] == "buy"
+
+
+def test_close_calm_exit_works_lighter_leg_as_maker():
+    var, lit = FakeVar(entry="4325"), MakerLighter(maker_fill_fraction=D("1"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    lit.pos = D("2.7")   # long lighter leg to close
+    legs = [
+        {"venue": "lighter", "symbol": "XAU", "side": "buy", "qty": "2.7", "price": "4320"},
+        {"venue": "variational", "symbol": "XAU", "side": "sell", "qty": "2.7", "price": "4330"},
+    ]
+    out = ex.close_hedge(legs, D("4331"), D("4322"), _BOOK, urgent=False)
+    # lighter close is a post-only SELL reduce-only, no taker needed
+    assert lit.maker_calls and lit.maker_calls[0]["side"] == "sell"
+    assert lit.maker_calls[0]["reduce_only"] is True
+    assert lit.calls == []
+    lit_leg = [c for c in out["legs"] if c["venue"] == "lighter"][0]
+    assert lit_leg["exit_source"] == "model"    # priced on model; rebate via venue_realized
+
+
+def test_close_urgent_exit_keeps_taker():
+    var, lit = FakeVar(entry="4325"), MakerLighter(maker_fill_fraction=D("1"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    lit.pos = D("2.7")
+    legs = [
+        {"venue": "lighter", "symbol": "XAU", "side": "buy", "qty": "2.7", "price": "4320"},
+        {"venue": "variational", "symbol": "XAU", "side": "sell", "qty": "2.7", "price": "4330"},
+    ]
+    out = ex.close_hedge(legs, D("4331"), D("4322"), _BOOK, urgent=True)
+    assert lit.maker_calls == []                # urgent -> taker only
+    assert lit.calls and lit.calls[0]["reduce_only"] is True
+    assert isinstance(out["price_pnl"], Decimal)

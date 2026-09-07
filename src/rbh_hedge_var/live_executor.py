@@ -55,6 +55,16 @@ class LiveExecutor:
         self.slippage = D(cfg.get("taker_slippage_pct", 0.0005))
         self.confirm_timeout_s = float(cfg.get("fill_confirm_timeout_s", 30))
         self.confirm_poll_s = float(cfg.get("fill_confirm_poll_s", 2))
+        # --- Lighter MAKER leg (desgin7/8 route ①) --------------------------
+        # Work the deep, liquid Lighter leg PASSIVELY with post-only limit orders
+        # to earn the maker rebate instead of paying the taker fee (~-0.22 ->
+        # ~-0.10/-0.13 wear per round). Entry ALWAYS finishes with a taker on any
+        # unfilled remainder so the book is never left naked; only time-rich
+        # exits use maker (urgent exits keep IOC for speed).
+        self.maker_enabled = bool(cfg.get("lighter_maker_enabled", True))
+        self.maker_fill_timeout_s = float(cfg.get("maker_fill_timeout_s", 45))
+        self.maker_max_requotes = int(cfg.get("maker_max_requotes", 2))
+        self.maker_fallback_offset_pct = D(cfg.get("maker_fallback_offset_pct", 0.0002))
 
     def _guard(self) -> None:
         if net_guard.is_armed():
@@ -68,25 +78,104 @@ class LiveExecutor:
         return D(self.var.signed_position(symbol))
 
     def _confirm_delta(self, venue: str, symbol: str, baseline: Decimal,
-                       expected_sign: int, step: Decimal) -> Decimal:
+                       expected_sign: int, step: Decimal, *,
+                       full_target: Decimal | None = None,
+                       timeout: float | None = None) -> Decimal:
         """Poll the venue position until the signed delta from ``baseline`` is a
         non-trivial fill in the expected direction, or timeout. Returns the
         ACTUAL signed delta (may be smaller than requested = partial fill), or
-        ZERO if nothing filled within the timeout."""
+        ZERO if nothing filled within the timeout.
+
+        ``full_target`` (maker path): keep polling until the delta reaches
+        (near) the full target size rather than returning on the first partial —
+        a resting maker order fills in pieces. ``timeout`` overrides the default
+        taker confirm window (maker orders are given a longer, configurable
+        patience window)."""
         half = abs(step) / D(2)
-        deadline = time.time() + self.confirm_timeout_s
+        tmo = self.confirm_timeout_s if timeout is None else timeout
+        deadline = time.time() + tmo
         last = ZERO
         while True:
             delta = self._signed(venue, symbol) - baseline
-            # accept once the fill is at least half a step in the right direction
-            if expected_sign > 0 and delta >= half:
-                return delta
-            if expected_sign < 0 and delta <= -half:
-                return delta
+            filled_dir = (expected_sign > 0 and delta >= half) or \
+                         (expected_sign < 0 and delta <= -half)
+            if filled_dir:
+                if full_target is None:
+                    return delta
+                if abs(delta) >= abs(full_target) - half:   # (near) fully filled
+                    return delta
             last = delta
             if time.time() >= deadline:
                 return last if abs(last) >= half else ZERO
             time.sleep(self.confirm_poll_s)
+
+    # ---- Lighter maker helpers --------------------------------------------
+    def _maker_limit_price(self, side: str,
+                           lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
+                           ref_price: Decimal) -> Decimal:
+        """Passive post-only price at the touch: a buy joins the best bid, a sell
+        joins the best ask (never crossing). Falls back to a small nudge behind
+        ``ref_price`` when the book side is unavailable."""
+        if lit_book:
+            levels = lit_book.get("bids") if side == "buy" else lit_book.get("asks")
+            if levels:
+                return D(levels[0][0])
+        nudge = D(ref_price) * self.maker_fallback_offset_pct
+        return D(ref_price) - nudge if side == "buy" else D(ref_price) + nudge
+
+    def _safe_cancel(self, symbol: str) -> None:
+        """Best-effort pull of any resting maker quote before re-quoting."""
+        try:
+            self.lighter.cancel_all(symbol)
+        except Exception:
+            pass
+
+    def _maker_work(self, lit_symbol: str, side: str, target_qty: Decimal,
+                    ref_price: Decimal, lit_size_step: Decimal,
+                    lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
+                    baseline: Decimal, sign: int, *, reduce_only: bool) -> Decimal:
+        """Work ``target_qty`` passively with post-only re-quotes at the touch.
+        Returns the signed delta actually achieved (may be partial — the caller
+        finishes the remainder with a taker). Never raises on a would-cross
+        reject: it cancels and re-quotes up to ``maker_max_requotes`` times."""
+        half = abs(lit_size_step) / D(2)
+        for _ in range(int(self.maker_max_requotes) + 1):
+            delta = self._signed("lighter", lit_symbol) - baseline
+            remaining = target_qty - abs(delta)
+            if remaining < half:
+                break
+            rq = quantize_down(remaining, lit_size_step)
+            if rq <= ZERO:
+                break
+            px = self._maker_limit_price(side, lit_book, ref_price)
+            try:
+                self.lighter.place_post_only_limit_order(
+                    lit_symbol, side, rq, px, reduce_only=reduce_only)
+            except Exception:
+                self._safe_cancel(lit_symbol)   # reject / transient -> re-quote
+                continue
+            self._confirm_delta("lighter", lit_symbol, baseline, sign, lit_size_step,
+                                full_target=target_qty, timeout=self.maker_fill_timeout_s)
+            self._safe_cancel(lit_symbol)       # pull the unfilled remainder
+        return self._signed("lighter", lit_symbol) - baseline
+
+    def _hedge_lighter(self, lit_symbol: str, side: str, target_qty: Decimal,
+                       ref_price: Decimal, lit_size_step: Decimal,
+                       lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
+                       baseline: Decimal, sign: int) -> Decimal:
+        """Fill the Lighter hedge of ``target_qty``. Maker-first (rebate), then
+        TAKER any unfilled remainder so the hedge is never left naked. Returns
+        the confirmed signed delta."""
+        if self.maker_enabled:
+            self._maker_work(lit_symbol, side, target_qty, ref_price, lit_size_step,
+                             lit_book, baseline, sign, reduce_only=False)
+        delta = self._signed("lighter", lit_symbol) - baseline
+        remaining = target_qty - abs(delta)
+        if remaining >= abs(lit_size_step) / D(2):
+            taker_qty = quantize_down(remaining, lit_size_step)
+            if taker_qty > ZERO:
+                self.lighter.place_market_order(lit_symbol, side, taker_qty, ref_price)
+        return self._confirm_delta("lighter", lit_symbol, baseline, sign, lit_size_step)
 
     # ---- entry -------------------------------------------------------------
     def open_hedge(self, direction: str, notional: Decimal,
@@ -117,20 +206,24 @@ class LiveExecutor:
         if actual_var_qty <= ZERO:
             raise LiveExecutionError("variational leg unconfirmed (no fill within timeout)")
 
-        # 2) hedge the ACTUAL filled qty (partial-fill safe) on Lighter, confirm.
+        # 2) hedge the ACTUAL filled qty (partial-fill safe) on Lighter. Maker
+        #    first for the rebate, then a taker sweep of any remainder so the
+        #    hedge is never left naked. Confirm the real total delta.
         lit_hedge_qty = quantize_down(actual_var_qty, lit_size_step)
         if lit_hedge_qty <= ZERO:
             self._flatten("variational", var_side, actual_var_qty, var_symbol, lit_price)
             raise LiveExecutionError("variational fill below one lighter size step; flattened")
         try:
-            self.lighter.place_market_order(lit_symbol, lit_side, lit_hedge_qty, lit_price)
+            lit_delta = self._hedge_lighter(lit_symbol, lit_side, lit_hedge_qty, lit_price,
+                                            lit_size_step, lit_book, base_lit, lit_sign)
         except Exception as exc:
+            self._safe_cancel(lit_symbol)
             self._flatten("variational", var_side, actual_var_qty, var_symbol, lit_price)
-            raise NakedLegError(f"Lighter hedge submit failed, flattened Variational: {exc}") from exc
-        lit_delta = self._confirm_delta("lighter", lit_symbol, base_lit, lit_sign, lit_size_step)
+            raise NakedLegError(f"Lighter hedge failed, flattened Variational: {exc}") from exc
         actual_lit_qty = abs(lit_delta)
         if actual_lit_qty <= ZERO:
             # hedge did not fill -> flatten the naked Variational leg.
+            self._safe_cancel(lit_symbol)
             self._flatten("variational", var_side, actual_var_qty, var_symbol, lit_price)
             raise NakedLegError("Lighter hedge unconfirmed; flattened Variational leg")
 
@@ -169,34 +262,57 @@ class LiveExecutor:
     # ---- exit --------------------------------------------------------------
     def close_hedge(self, legs: list[dict[str, Any]],
                     var_price: Decimal, lit_price: Decimal,
-                    lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None) -> dict[str, Any]:
+                    lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
+                    *, urgent: bool = True) -> dict[str, Any]:
         self._guard()
         # Variational (illiquid) first, then Lighter.
         legs_sorted = sorted(legs, key=lambda leg_x: 0 if leg_x["venue"] == "variational" else 1)
         price_pnl = ZERO
         closed = []
         sources: list[str] = []
+        # A calm exit (take-profit / reversal / max-hold) may work the Lighter
+        # leg PASSIVELY for the rebate; an urgent exit (stop-loss / watchdog /
+        # market-closing / drawdown) always takes for speed.
+        lit_maker = self.maker_enabled and not urgent
         for leg in legs_sorted:
             entry = D(leg["price"])
             qty = D(leg["qty"])
             open_side = leg["side"]
             close_side = "buy" if open_side == "sell" else "sell"
             base = self._signed(leg["venue"], leg["symbol"])
+            step = D("0.0001")
             if leg["venue"] == "variational":
                 resp = self.var.submit_market_order(close_side, qty, symbol=leg["symbol"],
                                                     reduce_only=True)
                 exit_price, exit_source = self._real_or_model_exit(
                     resp, close_side, D(var_price), None, qty)
-                step = D("0.0001")
             else:
-                resp = self.lighter.place_market_order(leg["symbol"], close_side, qty, lit_price,
-                                                       reduce_only=True)
                 levels = None
                 if lit_book:
                     levels = lit_book.get("bids") if close_side == "sell" else lit_book.get("asks")
-                exit_price, exit_source = self._real_or_model_exit(
-                    resp, close_side, D(lit_price), levels, qty)
-                step = D("0.0001")
+                if lit_maker:
+                    # passive reduce-only, then taker whatever remains so the leg
+                    # always reaches flat. Priced on the model (Lighter's deep
+                    # book is a faithful proxy); the maker rebate shows up in the
+                    # venue_realized reconciliation, not the model estimate.
+                    self._maker_work(leg["symbol"], close_side, qty, D(lit_price), step,
+                                     lit_book, base, 1 if close_side == "buy" else -1,
+                                     reduce_only=True)
+                    delta_so_far = self._signed(leg["venue"], leg["symbol"]) - base
+                    remaining = qty - abs(delta_so_far)
+                    if remaining >= step / D(2):
+                        tq = quantize_down(remaining, step)
+                        if tq > ZERO:
+                            self.lighter.place_market_order(leg["symbol"], close_side, tq,
+                                                            lit_price, reduce_only=True)
+                    exit_price = pricing.model_fill_price(close_side, D(lit_price), levels,
+                                                          qty, self.slippage)
+                    exit_source = "model"
+                else:
+                    resp = self.lighter.place_market_order(leg["symbol"], close_side, qty, lit_price,
+                                                           reduce_only=True)
+                    exit_price, exit_source = self._real_or_model_exit(
+                        resp, close_side, D(lit_price), levels, qty)
             # confirm the leg reduced (delta opposes the open side)
             delta = self._confirm_delta(leg["venue"], leg["symbol"], base,
                                         1 if close_side == "buy" else -1, step)

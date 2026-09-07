@@ -191,14 +191,93 @@ class LighterSignerClient:
             "base_amount": amt["base_amount"], "reduce_only": reduce_only,
         }
 
+    def place_post_only_limit_order(self, symbol: str, side: str, qty: Decimal,
+                                    limit_price: Decimal, *,
+                                    reduce_only: bool = False) -> dict[str, Any]:
+        """Passive MAKER order: a POST-ONLY limit at ``limit_price`` that rests on
+        the book and pays the maker rebate instead of the taker fee. ``side`` is
+        'buy'|'sell'.
+
+        POST-ONLY is the whole point: the sequencer REJECTS (never crosses) the
+        order if ``limit_price`` would take liquidity, so we can never silently
+        turn into a taker and lose the fee edge. The caller places at/behind the
+        touch, polls for a fill, and re-quotes or falls back to a taker on
+        timeout — that orchestration lives in ``LiveExecutor``.
+
+        The price is used EXACTLY as given (scaled to the market's price
+        decimals), unlike ``place_market_order`` which pads by a slippage cap.
+        """
+        if net_guard.is_armed():
+            raise net_guard.WriteBlockedError(
+                "write-guard armed: refusing Lighter post-only order (net_guard.disarm to go live)")
+        if side not in ("buy", "sell"):
+            raise LighterSignerError(f"bad side {side!r}")
+        is_ask = side == "sell"
+        amt = self.scaled_amounts(symbol, qty, D(limit_price))
+        signer = self._signer()
+        # Resolve the SDK enum values off the signer so we track the installed
+        # SDK (constants defined on SignerClient), with the documented fallbacks.
+        order_type = getattr(signer, "ORDER_TYPE_LIMIT", 0)
+        tif_post_only = getattr(signer, "ORDER_TIME_IN_FORCE_POST_ONLY", 2)
+        coi = _client_order_index()
+        # create_order(...) -> (CreateOrder, RespSendTx, err)
+        create, resp, err = self._loop_run(signer.create_order(
+            market_index=amt["market_index"],
+            client_order_index=coi,
+            base_amount=amt["base_amount"],
+            price=amt["price_scaled"],
+            is_ask=is_ask,
+            order_type=order_type,
+            time_in_force=tif_post_only,
+            reduce_only=reduce_only,
+        ))
+        if err is not None:
+            # A post-only reject (order would cross) surfaces here too — the
+            # caller treats any placement failure as "did not rest" and re-quotes.
+            raise LighterSignerError(f"Lighter post-only create_order failed: {err}")
+        order_index = None
+        if create is not None:
+            order_index = getattr(create, "order_index", None) or getattr(create, "OrderIndex", None)
+        tx_hash = getattr(resp, "tx_hash", None) if resp is not None else None
+        return {
+            "venue": "lighter", "symbol": symbol.upper(), "side": side,
+            "post_only": True, "client_order_index": coi, "tx_hash": tx_hash,
+            "order_index": order_index, "price": str(D(limit_price)),
+            "base_amount": amt["base_amount"], "reduce_only": reduce_only,
+        }
+
     def cancel_all(self, symbol: str | None = None) -> dict[str, Any]:
+        """Cancel resting orders. Scoped to ``symbol``'s market when given, else
+        all markets. Used to pull an unfilled maker quote before re-quoting or
+        abandoning to a taker.
+
+        The SDK's ``cancel_all_orders(time_in_force, timestamp_ms,
+        cancel_all_market_index=...)`` requires a scheduling TIF + timestamp;
+        we cancel IMMEDIATELY. Older single-arg SDKs are tolerated via inspect.
+        """
         if net_guard.is_armed():
             raise net_guard.WriteBlockedError("write-guard armed: refusing Lighter cancel_all")
         signer = self._signer()
-        tx, tx_hash, err = self._loop_run(signer.cancel_all_orders())
+        market_index = None
+        if symbol is not None:
+            market_index = int(self._market_meta(symbol)["market_id"])
+        import inspect
+        params = inspect.signature(signer.cancel_all_orders).parameters
+        if "time_in_force" in params or "timestamp_ms" in params:
+            tif_immediate = getattr(signer, "CANCEL_ALL_TIF_IMMEDIATE", 0)
+            kwargs: dict[str, Any] = {
+                "time_in_force": tif_immediate,
+                "timestamp_ms": int(time.time() * 1000),
+            }
+            if market_index is not None and "cancel_all_market_index" in params:
+                kwargs["cancel_all_market_index"] = market_index
+            tx, tx_hash, err = self._loop_run(signer.cancel_all_orders(**kwargs))
+        else:  # pragma: no cover - legacy SDK signature
+            tx, tx_hash, err = self._loop_run(signer.cancel_all_orders())
         if err is not None:
             raise LighterSignerError(f"Lighter cancel_all failed: {err}")
-        return {"venue": "lighter", "cancelled": True, "tx_hash": tx_hash}
+        return {"venue": "lighter", "cancelled": True, "tx_hash": tx_hash,
+                "market_index": market_index}
 
     # ---- reconciliation (read-only) ---------------------------------------
     def signed_position(self, symbol: str) -> Decimal:
