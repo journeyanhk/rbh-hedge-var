@@ -185,6 +185,59 @@ class LiveExecutor:
                 return False              # zombie still resting
             time.sleep(self.maker_cancel_verify_poll_s)
 
+    def maker_cancel_selfcheck(self, symbol: str, size_step: Decimal) -> tuple[bool, str]:
+        """PRE-FLIGHT proof that the maker leg's load-bearing wall — a verified
+        cancel — actually works on the LIVE venue before we trust it in a hedge
+        (var-desgin9). Runs the same lifecycle as the `cancel-test` CLI, through
+        the SAME ``_cancel_verified`` path the executor uses in anger:
+
+          place ONE tiny post-only BUY well BELOW the touch (post-only => rests,
+          never crosses/fills) -> confirm it RESTS -> _cancel_verified (cancel +
+          poll until proven empty) -> confirm the position never moved.
+
+        Returns (ok, human-readable detail). ok is True ONLY when the cancel was
+        verifiably clean AND the position is unchanged. The caller (engine
+        pre-flight) downgrades the maker leg to IOC on a False so a broken cancel
+        can never reach a live hedge. The write-guard must already be disarmed;
+        a finally-block cancel is fired as a safety net so no probe order leaks."""
+        below_pct = D(str(self.cfg.get("cancel_test_below_pct", "0.03")))
+        notional = D(str(self.cfg.get("cancel_test_notional_usdt", 50)))
+        book = self._fresh_book(symbol)
+        bids = (book or {}).get("bids") or []
+        if not bids:
+            return False, "no bids on the Lighter book — cannot pick a resting price"
+        best_bid = D(bids[0][0])
+        px = best_bid * (D(1) - below_pct)
+        qty = economics.qty_for_notional(notional, px, size_step)
+        if qty <= ZERO:
+            qty = abs(size_step)
+        try:
+            base_pos = D(self.lighter.signed_position(symbol))
+            self.lighter.place_post_only_limit_order(symbol, "buy", qty, px, reduce_only=False)
+            rested = False
+            deadline = time.time() + self.maker_cancel_verify_timeout_s
+            while time.time() < deadline:
+                orders = self._open_orders(symbol)
+                if orders:
+                    rested = True
+                    break
+                if orders is None:
+                    break
+                time.sleep(self.maker_cancel_verify_poll_s)
+            cleared = self._cancel_verified(symbol)
+            moved = D(self.lighter.signed_position(symbol)) - base_pos
+            if cleared and abs(moved) <= abs(size_step) / D(2):
+                note = "" if rested else " (order never seen resting — filled or unqueryable)"
+                return True, f"cancel verified clean, position unchanged{note}"
+            return False, f"cancel NOT verified (cleared={cleared}, position_moved={moved})"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                self.lighter.cancel_all(symbol)   # safety net: never leak a probe order
+            except Exception:
+                pass
+
     def _fresh_book(self, symbol: str) -> dict[str, list[tuple[Decimal, Decimal]]] | None:
         """Re-read the live Lighter book for a re-quote (P1-B). The engine's
         per-tick snapshot book can be up to a tick (~60s) stale, so a re-quote

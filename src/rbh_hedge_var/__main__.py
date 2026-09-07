@@ -478,6 +478,11 @@ def cmd_run(cfg) -> int:
     if halted:
         print(f"[run] STARTUP HALT: {halted} — not trading until resolved "
               "(flatten & clear-halt from flat, or fix preflight + arm).", flush=True)
+    # var-desgin9: before trusting the maker leg live, PROVE a verified cancel
+    # works on the venue; a failure auto-downgrades maker -> IOC (loud) so a
+    # broken cancel can never strand a zombie order in a live hedge.
+    if live and not halted:
+        eng.maker_preflight()
     serve(cfg.get("state_file", "state.json"),
           get_snapshot=lambda: _display(eng.last_snapshot),
           host=cfg.get("monitor_bind", "127.0.0.1"),

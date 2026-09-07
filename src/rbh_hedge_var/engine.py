@@ -853,6 +853,33 @@ class Engine:
             pass
         return D("0.0000001")
 
+    def maker_preflight(self) -> bool:
+        """var-desgin9: before the engine trusts the maker leg live, PROVE that a
+        verified cancel actually works on the venue. Runs the maker cancel
+        self-check (same lifecycle as `cancel-test`); on failure it AUTO-DOWNGRADES
+        the maker leg to IOC for this process and alerts, so a broken cancel (an
+        SDK/venue change like the CancelAllTime reject) can never reach a live
+        hedge and strand a zombie order. No-op unless live with maker enabled.
+        Must be called AFTER the write-guard is disarmed. Returns True when maker
+        is safe (or was never in play), False when it was downgraded."""
+        ex = self._live_executor
+        if ex is None or net_guard.is_armed() or not getattr(ex, "maker_enabled", False):
+            return True
+        ok, detail = ex.maker_cancel_selfcheck(self.lighter_symbol, self._size_step())
+        if ok:
+            self._log(f"[MAKER-PREFLIGHT] cancel verified OK -> maker leg armed ({detail})")
+            return True
+        ex.maker_enabled = False   # auto-downgrade to IOC for this process
+        msg = (f"maker cancel self-check FAILED ({detail}) -> auto-downgraded to "
+               f"IOC (taker-only) for this run. Investigate cancel_all before "
+               f"re-enabling maker.")
+        self._log(f"[MAKER-PREFLIGHT] {msg}")
+        try:
+            self.tg.send(f"⚠️ {msg}")
+        except Exception:
+            pass
+        return False
+
     def _funding_auth_token(self) -> str | None:
         """Signed auth token for the private /api/v1/positionFunding read.
 

@@ -477,3 +477,37 @@ def test_urgent_exit_reasons_keep_taker(tmp_path):
     assert _exit_urgent_flag(tmp_path, "daily_loss_halt") is True
     assert _exit_urgent_flag(tmp_path, "market_closing") is True
     assert _exit_urgent_flag(tmp_path, "basis_force_exit 0.05") is True
+
+
+# --- var-desgin9: maker cancel pre-flight self-check -------------------------
+def test_maker_preflight_downgrades_to_ioc_on_failed_selfcheck(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng._live_executor.maker_enabled = True
+    eng._live_executor.maker_cancel_selfcheck = lambda sym, step: (False, "zombie survived")
+    assert eng.maker_preflight() is False
+    assert eng._live_executor.maker_enabled is False   # auto-downgraded to IOC
+
+
+def test_maker_preflight_keeps_maker_on_pass(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng._live_executor.maker_enabled = True
+    eng._live_executor.maker_cancel_selfcheck = lambda sym, step: (True, "clean")
+    assert eng.maker_preflight() is True
+    assert eng._live_executor.maker_enabled is True
+
+
+def test_maker_preflight_noop_when_maker_disabled(tmp_path):
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng._live_executor.maker_enabled = False
+    called = {"n": 0}
+
+    def spy(sym, step):
+        called["n"] += 1
+        return (False, "should not run")
+
+    eng._live_executor.maker_cancel_selfcheck = spy
+    assert eng.maker_preflight() is True    # no-op, maker already off
+    assert called["n"] == 0

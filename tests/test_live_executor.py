@@ -486,3 +486,25 @@ def test_open_residual_resting_order_blocks_holding():
     with pytest.raises(NakedLegError):
         ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
                       D("0.0001"), _BOOK)
+
+
+# ---- var-desgin9 maker cancel self-check (pre-flight gate) -------------------
+def test_maker_selfcheck_passes_when_cancel_verifies():
+    fresh = {"bids": [(D("4390"), D("100"))], "asks": [(D("4392"), D("100"))]}
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("0"), fresh_book=fresh)
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    ok, detail = ex.maker_cancel_selfcheck("XAU", D("0.0001"))
+    assert ok is True
+    assert lit.pos == ZERO                 # probe never moved the position
+    assert lit.open_orders("XAU") == []    # probe order cleaned up
+
+
+def test_maker_selfcheck_fails_on_zombie_cancel():
+    fresh = {"bids": [(D("4390"), D("100"))], "asks": [(D("4392"), D("100"))]}
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("0"), fresh_book=fresh,
+                                       cancel_leaves_zombie=True)
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    ok, detail = ex.maker_cancel_selfcheck("XAU", D("0.0001"))
+    assert ok is False                     # cancel could not be proven clean
