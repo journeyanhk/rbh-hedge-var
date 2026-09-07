@@ -244,20 +244,38 @@ def test_close_falls_back_to_model_without_venue_price():
 _BOOK = {"bids": [(D("4319"), D("100"))], "asks": [(D("4321"), D("100"))]}
 
 
+class _FakeRead:
+    def __init__(self, book):
+        self._book = book
+
+    def order_book(self, symbol):
+        return self._book
+
+
 class MakerLighter:
     """Post-only maker fake. A post-only order fills ``maker_fill_fraction`` of
     the requested qty into self.pos (models a passive fill); a taker fills fully.
-    Records maker/taker/cancel calls so a test can assert which path ran."""
+    Records maker/taker/cancel calls so a test can assert which path ran.
 
-    def __init__(self, maker_fill_fraction=D("1"), entry="4320"):
+    ``fresh_book`` (review21 P1-B): when given, exposes a ``.read.order_book``
+    the executor re-reads on each re-quote — distinct from the stale snapshot
+    book passed by the engine — so tests can prove re-quotes use the fresh touch
+    and the drift-abort fires."""
+
+    def __init__(self, maker_fill_fraction=D("1"), entry="4320", fresh_book=None,
+                 post_only_exc=None):
         self.calls = []          # taker
         self.maker_calls = []    # post-only
         self.cancels = []
         self.pos = ZERO
         self.entry = D(entry)
         self.maker_fill_fraction = D(maker_fill_fraction)
+        self.post_only_exc = post_only_exc
+        self.read = _FakeRead(fresh_book) if fresh_book is not None else None
 
     def place_post_only_limit_order(self, symbol, side, qty, limit_price, reduce_only=False):
+        if self.post_only_exc is not None:
+            raise self.post_only_exc
         filled = D(qty) * self.maker_fill_fraction
         self.maker_calls.append({"symbol": symbol, "side": side, "qty": D(qty),
                                  "price": D(limit_price), "reduce_only": reduce_only})
@@ -364,3 +382,45 @@ def test_close_urgent_exit_keeps_taker():
     assert lit.maker_calls == []                # urgent -> taker only
     assert lit.calls and lit.calls[0]["reduce_only"] is True
     assert isinstance(out["price_pnl"], Decimal)
+
+
+# ---- review21 P1-A / P1-B / drift-abort ------------------------------------
+def test_open_degrades_to_taker_when_sdk_lacks_maker_enums():
+    # P1-A: place_post_only raises MakerNotSupportedError (SDK enums missing) ->
+    # the passive path aborts immediately and the taker sweeps (never guesses TIF).
+    from rbh_hedge_var.lighter_signer import MakerNotSupportedError
+    var = FakeVar()
+    lit = MakerLighter(post_only_exc=MakerNotSupportedError("no enums"))
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls == []                 # never recorded a maker fill
+    assert lit.calls and lit.calls[0]["side"] == "buy"   # taker did the hedge
+
+
+def test_maker_requote_uses_fresh_book_not_stale_snapshot():
+    # P1-B: the engine passes a STALE snapshot book (best bid 4319) but the fresh
+    # read shows best bid 4315 — the maker quote must use the fresh touch.
+    fresh = {"bids": [(D("4315"), D("100"))], "asks": [(D("4317"), D("100"))]}
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("1"), fresh_book=fresh)
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                  D("0.0001"), _BOOK)   # stale book _BOOK bid=4319
+    assert lit.maker_calls and lit.maker_calls[0]["price"] == D("4315")   # fresh
+
+
+def test_maker_aborts_on_price_drift_and_takers():
+    # drift-abort: fresh mid (4401) is >0.1% away from ref (4320) -> abandon the
+    # passive attempt and taker-sweep, so the leg never waits through a big move.
+    drifted = {"bids": [(D("4400"), D("100"))], "asks": [(D("4402"), D("100"))]}
+    var, lit = FakeVar(), MakerLighter(maker_fill_fraction=D("1"), fresh_book=drifted)
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.open_hedge("short_var_long_lighter", D("12000"), D("4330"), D("4320"),
+                        D("0.0001"), _BOOK)
+    assert out["both_filled"] is True
+    assert lit.maker_calls == []                 # drift aborted before any quote
+    assert lit.calls and lit.calls[0]["side"] == "buy"   # taker hedged instead

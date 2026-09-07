@@ -95,6 +95,7 @@
   "maker_fill_timeout_s": 45,
   "maker_max_requotes": 2,
   "maker_fallback_offset_pct": 0.0002,
+  "maker_price_drift_abort_pct": 0.001,
 
   "//live_reconcile": "review4 P0-C/P1-1: IDLE flat-check cadence (every N ticks while live) and how many CONSECUTIVE reconcile failures before a HOLDING round forces a protective exit.",
   "idle_reconcile_every_ticks": 20,

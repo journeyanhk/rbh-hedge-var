@@ -202,3 +202,19 @@ def test_cancel_all_blocked_while_armed():
     c = _client(signer=FakeSigner())
     with pytest.raises(WriteBlockedError):
         c.cancel_all("XAU")
+
+
+def test_post_only_fails_closed_when_sdk_lacks_enums():
+    # P1-A (review21): a SignerClient without the post-only enums must raise
+    # MakerNotSupportedError rather than guess a TIF that could silently fill
+    # as a taker.
+    from rbh_hedge_var.lighter_signer import MakerNotSupportedError
+
+    class NoEnumSigner:
+        def create_order(self, **kw):
+            raise AssertionError("must not reach create_order without enums")
+
+    c = _client(signer=NoEnumSigner())
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(MakerNotSupportedError):
+        c.place_post_only_limit_order("XAU", "buy", D("2.7"), D("4319"))

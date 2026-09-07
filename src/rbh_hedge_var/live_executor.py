@@ -33,6 +33,7 @@ from decimal import Decimal
 from typing import Any
 
 from . import economics, net_guard, pricing
+from .lighter_signer import MakerNotSupportedError
 from .numeric import ZERO, D, quantize_down
 
 
@@ -65,6 +66,11 @@ class LiveExecutor:
         self.maker_fill_timeout_s = float(cfg.get("maker_fill_timeout_s", 45))
         self.maker_max_requotes = int(cfg.get("maker_max_requotes", 2))
         self.maker_fallback_offset_pct = D(cfg.get("maker_fallback_offset_pct", 0.0002))
+        # P1-B/drift (review21): re-quote at a FRESH touch each cycle, and abandon
+        # the passive attempt (taker-sweep) once the market drifts this far from
+        # the reference price — so the maker patience window can never bleed into
+        # a large adverse move while a leg waits.
+        self.maker_price_drift_abort_pct = D(cfg.get("maker_price_drift_abort_pct", 0.001))
 
     def _guard(self) -> None:
         if net_guard.is_armed():
@@ -130,29 +136,69 @@ class LiveExecutor:
         except Exception:
             pass
 
+    def _fresh_book(self, symbol: str) -> dict[str, list[tuple[Decimal, Decimal]]] | None:
+        """Re-read the live Lighter book for a re-quote (P1-B). The engine's
+        per-tick snapshot book can be up to a tick (~60s) stale, so a re-quote
+        that keeps using it either never fills (price ran away) or gets post-only
+        rejected in a loop (price came back). Best-effort: falls back to the
+        snapshot book when the read client is unavailable (e.g. test fakes)."""
+        read = getattr(self.lighter, "read", None)
+        if read is None or not hasattr(read, "order_book"):
+            return None
+        try:
+            return read.order_book(symbol)
+        except Exception:
+            return None
+
+    def _book_mid(self, book: dict[str, list[tuple[Decimal, Decimal]]] | None) -> Decimal | None:
+        if not book:
+            return None
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            return None
+        return (D(bids[0][0]) + D(asks[0][0])) / D(2)
+
     def _maker_work(self, lit_symbol: str, side: str, target_qty: Decimal,
                     ref_price: Decimal, lit_size_step: Decimal,
                     lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
                     baseline: Decimal, sign: int, *, reduce_only: bool) -> Decimal:
         """Work ``target_qty`` passively with post-only re-quotes at the touch.
         Returns the signed delta actually achieved (may be partial — the caller
-        finishes the remainder with a taker). Never raises on a would-cross
-        reject: it cancels and re-quotes up to ``maker_max_requotes`` times."""
+        finishes the remainder with a taker).
+
+        review21 patches:
+          * P1-B: each re-quote reads a FRESH book (falls back to the snapshot).
+          * drift-abort: if the market has drifted more than
+            ``maker_price_drift_abort_pct`` from ``ref_price``, stop waiting and
+            let the caller taker-sweep — the patience window must never sit open
+            through a large adverse move.
+          * P1-A: a MakerNotSupportedError (SDK enums missing) aborts the passive
+            path immediately so the caller degrades to IOC (never guesses TIF).
+        A would-cross reject (generic exception) still cancels and re-quotes.
+        """
         half = abs(lit_size_step) / D(2)
         for _ in range(int(self.maker_max_requotes) + 1):
             delta = self._signed("lighter", lit_symbol) - baseline
             remaining = target_qty - abs(delta)
             if remaining < half:
                 break
+            book = self._fresh_book(lit_symbol) or lit_book
+            mid = self._book_mid(book)
+            if mid is not None and ref_price > ZERO and \
+                    abs(mid - ref_price) / ref_price > self.maker_price_drift_abort_pct:
+                break   # drifted too far -> abandon passive, taker-sweep
             rq = quantize_down(remaining, lit_size_step)
             if rq <= ZERO:
                 break
-            px = self._maker_limit_price(side, lit_book, ref_price)
+            px = self._maker_limit_price(side, book, ref_price)
             try:
                 self.lighter.place_post_only_limit_order(
                     lit_symbol, side, rq, px, reduce_only=reduce_only)
+            except MakerNotSupportedError:
+                break   # SDK cannot maker -> degrade to taker (never guess enum)
             except Exception:
-                self._safe_cancel(lit_symbol)   # reject / transient -> re-quote
+                self._safe_cancel(lit_symbol)   # would-cross / transient -> re-quote
                 continue
             self._confirm_delta("lighter", lit_symbol, baseline, sign, lit_size_step,
                                 full_target=target_qty, timeout=self.maker_fill_timeout_s)

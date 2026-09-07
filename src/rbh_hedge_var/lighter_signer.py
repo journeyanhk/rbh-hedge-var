@@ -42,6 +42,13 @@ class LighterSignerError(RuntimeError):
     pass
 
 
+class MakerNotSupportedError(LighterSignerError):
+    """The installed SDK does not expose the post-only order enums, so a maker
+    order cannot be placed WITHOUT risking a silent loss of post-only protection
+    (which would turn it into a taker). The executor catches this and degrades
+    to the IOC taker path instead of guessing the enum values."""
+
+
 def _client_order_index() -> int:
     """Unique-ish per-order client index (uint). Lighter dedupes on this."""
     return int(time.time() * 1000) % 2_000_000_000 + (uuid.uuid4().int % 1000)
@@ -215,10 +222,18 @@ class LighterSignerClient:
         is_ask = side == "sell"
         amt = self.scaled_amounts(symbol, qty, D(limit_price))
         signer = self._signer()
-        # Resolve the SDK enum values off the signer so we track the installed
-        # SDK (constants defined on SignerClient), with the documented fallbacks.
-        order_type = getattr(signer, "ORDER_TYPE_LIMIT", 0)
-        tif_post_only = getattr(signer, "ORDER_TIME_IN_FORCE_POST_ONLY", 2)
+        # P1-A (review21): FAIL-CLOSED on the SDK enums. A missing constant must
+        # NOT be guessed — a wrong time_in_force would silently drop post-only
+        # protection and fill as a taker. Refuse instead, so the executor
+        # degrades to the explicit IOC path rather than paying an unintended fee.
+        try:
+            order_type = signer.ORDER_TYPE_LIMIT
+            tif_post_only = signer.ORDER_TIME_IN_FORCE_POST_ONLY
+        except AttributeError as exc:
+            raise MakerNotSupportedError(
+                "installed lighter SDK lacks ORDER_TYPE_LIMIT / "
+                "ORDER_TIME_IN_FORCE_POST_ONLY — refusing to place a maker order "
+                "that could silently lose post-only protection") from exc
         coi = _client_order_index()
         # create_order(...) -> (CreateOrder, RespSendTx, err)
         create, resp, err = self._loop_run(signer.create_order(
