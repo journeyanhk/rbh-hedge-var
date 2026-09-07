@@ -13,6 +13,7 @@ Commands:
   verify-funding (Phase 2) prove Lighter funding cadence -> write attestation
   funding-raw  (Phase 2) dump RAW positionFunding rows + rate/USD expectation (diagnostic)
   probe-quote  (Phase 2) discover the accepted /api/quotes/indicative instrument schema (diagnostic)
+  dump-asset   (Phase 2) print RAW /api/metadata/supported_assets for a symbol (is it tradeable? diagnostic)
   cancel-test  (Phase 2) prove cancel_all clears a resting post-only order on the LIVE venue (review22 diagnostic)
 
 Live execution (Phase 2) is OFF unless ALL hold:
@@ -200,6 +201,32 @@ def cmd_funding_raw(cfg) -> int:
         eng.close()
     print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
     return 0 if result.get("ok") else 1
+
+
+def cmd_dump_asset(cfg, argv: list[str]) -> int:
+    """Diagnostic: print the RAW /api/metadata/supported_assets response for a
+    symbol, verbatim. Answers the pre-BTC-migration question 'does Variational
+    actually LIST a tradeable BTC instrument, and with what exact instrument_type
+    / funding_interval_s / settlement_asset?' — the probe-quote 'unsupported
+    instrument: P-BTC-USDC-28800' reject means the guessed identity is not a
+    listed market, so we need the venue's own truth. Read-only GET (impersonated
+    like the gateway), no order surface touched.
+
+    Usage: dump-asset [SYMBOL]   (defaults to config variational.symbol)"""
+    from . import http_util
+    vcfg = dict(cfg.get("variational", {}))
+    base_url = vcfg.get("base_url", "https://omni.variational.io").rstrip("/")
+    sym = (argv[1] if len(argv) > 1 and not argv[1].startswith("-")
+           else vcfg.get("symbol", "XAU")).upper()
+    url = f"{base_url}/api/metadata/supported_assets?cex_asset={sym}"
+    print(f"# GET {url}", flush=True)
+    res = http_util.get_json(url, impersonate=True, timeout=20)
+    print(f"# HTTP {res.status}", flush=True)
+    try:
+        print(json.dumps(res.json, indent=2, ensure_ascii=False, default=str))
+    except Exception:
+        print(res.text[:4000])
+    return 0 if res.status == 200 else 1
 
 
 def cmd_probe_quote(cfg) -> int:
@@ -521,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_funding_raw(cfg)
     if command == "probe-quote":
         return cmd_probe_quote(cfg)
+    if command == "dump-asset":
+        return cmd_dump_asset(cfg, argv)
     if command == "cancel-test":
         return cmd_cancel_test(cfg)
     print(f"unknown command: {command}\n{__doc__}")
