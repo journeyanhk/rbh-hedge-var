@@ -421,8 +421,16 @@ def test_failed_open_with_residual_still_halts(tmp_path):
     eng = _engine(tmp_path, live=True)
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     eng._lighter_signer.place_market_order = lambda *a, **k: {"client_order_index": 1, "tx_hash": "0x"}
-    # reconcile sees a LEFTOVER Lighter position -> not flat -> keep the hard HALT
-    eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("2.7")}]}
+    # P0-3: the pre-open gate reads FLAT first (open proceeds), then the failed
+    # open leaves a residual Lighter position so the rollback-flat check HALTs.
+    _snap_calls = {"n": 0}
+
+    def _stateful_snapshot():
+        _snap_calls["n"] += 1
+        qty = D("0") if _snap_calls["n"] == 1 else D("2.7")
+        return {"positions": [{"symbol": "XAU", "qty": qty}]}
+
+    eng.lighter.account_snapshot = _stateful_snapshot
     action = eng._do_entry("short_var_long_lighter", "t", _snap())
     assert action.startswith("entry_naked_leg")
     assert eng.sm.is_halted()
@@ -511,3 +519,40 @@ def test_maker_preflight_noop_when_maker_disabled(tmp_path):
     eng._live_executor.maker_cancel_selfcheck = spy
     assert eng.maker_preflight() is True    # no-op, maker already off
     assert called["n"] == 0
+
+
+# ---- review23/24 P0-3: pre-open absolute-flat gate -------------------------
+def test_preopen_gate_blocks_and_halts_on_residual(tmp_path):
+    # A prior close silently failed and left residual on Lighter. Opening on top
+    # is exactly how 9/8 stacked 5 shorts, so the pre-open gate HALTs instead.
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("0.0679")}]}
+    action = eng._do_entry("short_lighter_long_var", "t", _snap())
+    assert action == "preopen_blocked:not_flat"
+    assert eng.sm.is_halted()
+    assert "preopen" in (eng.sm.halt_reason() or "")
+
+
+def test_preopen_gate_halts_when_positions_unreadable(tmp_path):
+    # Fail closed: if we cannot PROVE both venues flat, do not open.
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+
+    def _boom():
+        raise RuntimeError("venue read down")
+
+    eng.lighter.account_snapshot = _boom
+    action = eng._do_entry("short_lighter_long_var", "t", _snap())
+    assert action.startswith("preopen_blocked:")
+    assert eng.sm.is_halted()
+
+
+def test_preopen_gate_passes_when_flat(tmp_path):
+    # Proven-flat book -> gate returns None and the open proceeds to a live open.
+    eng = _engine(tmp_path, live=True)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    eng.lighter.account_snapshot = lambda: {"positions": []}
+    action = eng._do_entry("short_lighter_long_var", "t", _snap())
+    assert action == "live_open:short_lighter_long_var"
+    assert not eng.sm.is_halted()

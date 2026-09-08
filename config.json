@@ -90,8 +90,11 @@
   "fill_confirm_timeout_s": 30,
   "fill_confirm_poll_s": 2,
 
+  "//exit_flat_confirm": "review23/24 P0-1: a close is REAL only when the leg reaches flat. If _confirm_delta shows residual, retry ONCE at a fresh book price with THIS wide slippage cap; still not flat -> ExitNotFlatError -> HALT (never book a phantom close). 0.5% is the max we will pay to guarantee a flat.",
+  "exit_retry_slippage_pct": 0.005,
+
   "//lighter_maker": "desgin7/8 route ①: work the deep Lighter leg PASSIVELY with post-only limit orders for the maker rebate (~-0.22 -> ~-0.10/-0.13 wear per round). Entry ALWAYS taker-sweeps any unfilled remainder (never leaves a naked leg); only calm exits (take-profit/reversal/max-hold) use maker, urgent exits keep IOC.",
-  "//lighter_maker_disabled": "review22: kept OFF (IOC only) until cancel_all is empirically PROVEN to clear resting post-only orders on the live venue. The 13:09 double-hedge was a zombie order that survived a silently-swallowed cancel. Re-enable ONLY after a server-side cancel test passes.",
+  "//lighter_maker_disabled": "review23/24: kept OFF (IOC only). 9/8 incident: with maker armed, the calm max-hold close ran the never-crossing post-only path and its Lighter buy-to-close silently zero-filled; four watchdog taker closes also zero-filled -> five stacked shorts, -7.4U. Re-enable ONLY after (a) the exit flat-confirm wall (P0-1) has run clean 48h AND (b) the B universal reconcile gate ships AND (c) leg-order flip (post-only only while flat/hedged).",
   "lighter_maker_enabled": false,
   "maker_fill_timeout_s": 45,
   "maker_max_requotes": 2,

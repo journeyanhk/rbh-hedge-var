@@ -46,6 +46,15 @@ class NakedLegError(LiveExecutionError):
     residual position. The engine treats this as a HALT-worthy emergency."""
 
 
+class ExitNotFlatError(LiveExecutionError):
+    """Raised when a close leg cannot be confirmed FLAT even after a fresh-price
+    retry (review23/24). This is the EXIT-side twin of NakedLegError: a market
+    ACK / model price is not a fill — only a position that returned to flat is a
+    real close. On 9/8 every Lighter buy-to-close silently zero-filled and was
+    booked as 'closed' off the model price, so five shorts stacked before the
+    rollback check caught it. Never swallow: HALT so a human reconciles."""
+
+
 class MakerCancelError(LiveExecutionError):
     """Raised when a resting maker order could NOT be verified as cancelled
     (review22). A silently-failed cancel leaves a 'zombie' post-only that fills
@@ -85,6 +94,11 @@ class LiveExecutor:
         # window is treated as 'not cancelled' and escalates (never taker-swept).
         self.maker_cancel_verify_timeout_s = float(cfg.get("maker_cancel_verify_timeout_s", 5))
         self.maker_cancel_verify_poll_s = float(cfg.get("maker_cancel_verify_poll_s", 0.5))
+        # P0-1 (review23/24): a close leg that did not reach flat gets ONE bounded
+        # retry at a FRESH book price with a WIDE slippage cap (a stale/thin IOC
+        # or a non-crossing post-only leaves residual). Paying spread to guarantee
+        # a flat is always cheaper than stranding a naked leg into a trend.
+        self.exit_retry_slippage_pct = D(cfg.get("exit_retry_slippage_pct", 0.005))
 
     def _guard(self) -> None:
         if net_guard.is_armed():
@@ -424,6 +438,28 @@ class LiveExecutor:
                 f"CRITICAL: failed to flatten residual {venue} {symbol} qty={qty}: {exc}") from exc
 
     # ---- exit --------------------------------------------------------------
+    def _retry_close_to_flat(self, leg: dict[str, Any], close_side: str, csign: int,
+                             base: Decimal, qty: Decimal, delta: Decimal, step: Decimal,
+                             lit_price: Decimal) -> Decimal:
+        """P0-1: one bounded retry of a close leg that did not reach flat. Sends
+        the UNFILLED remainder as a reduce-only taker at a FRESH book price with
+        a WIDE slippage cap so a stale/thin IOC crosses, then re-confirms against
+        the ORIGINAL baseline (cumulative). The retry ACK is never trusted — only
+        the returned position delta decides. Returns the cumulative signed delta
+        (caller raises ExitNotFlatError if it is still short of flat)."""
+        remaining = quantize_down(qty - abs(delta), step)
+        if remaining <= ZERO:
+            return delta
+        if leg["venue"] == "variational":
+            self.var.submit_market_order(close_side, remaining, symbol=leg["symbol"],
+                                         reduce_only=True)
+        else:
+            ref = self._book_mid(self._fresh_book(leg["symbol"])) or D(lit_price)
+            self.lighter.place_market_order(leg["symbol"], close_side, remaining, ref,
+                                            reduce_only=True,
+                                            slippage_pct=self.exit_retry_slippage_pct)
+        return self._confirm_delta(leg["venue"], leg["symbol"], base, csign, step)
+
     def close_hedge(self, legs: list[dict[str, Any]],
                     var_price: Decimal, lit_price: Decimal,
                     lit_book: dict[str, list[tuple[Decimal, Decimal]]] | None,
@@ -478,8 +514,22 @@ class LiveExecutor:
                     exit_price, exit_source = self._real_or_model_exit(
                         resp, close_side, D(lit_price), levels, qty)
             # confirm the leg reduced (delta opposes the open side)
-            delta = self._confirm_delta(leg["venue"], leg["symbol"], base,
-                                        1 if close_side == "buy" else -1, step)
+            csign = 1 if close_side == "buy" else -1
+            delta = self._confirm_delta(leg["venue"], leg["symbol"], base, csign, step)
+            # P0-1 (review23/24): a close is REAL only when the leg reaches flat.
+            # `_confirm_delta` returns the ACTUAL reduction; a zero/partial fill
+            # (non-crossing post-only, stale-priced IOC, reject) leaves residual.
+            # Retry ONCE at a FRESH book price + wide slippage, re-confirm against
+            # the ORIGINAL baseline, and if the leg is STILL not flat, RAISE so
+            # the engine HALTs — never book a phantom "closed".
+            if qty - abs(delta) >= step / D(2):
+                delta = self._retry_close_to_flat(
+                    leg, close_side, csign, base, qty, delta, step, D(lit_price))
+            if qty - abs(delta) >= step / D(2):
+                raise ExitNotFlatError(
+                    f"{leg['venue']} {leg['symbol']} close UNCONFIRMED: wanted {qty} "
+                    f"{close_side} reduce-only, position moved only {abs(delta)} "
+                    f"after fresh-price retry -> HALT (ACK != fill)")
             if open_side == "buy":
                 price_pnl += (exit_price - entry) * qty
             else:

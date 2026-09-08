@@ -168,9 +168,18 @@ def test_do_entry_naked_leg_halts(tmp_path):
 
     eng._live_executor = NakedExec()
     eng._var_gateway = FakeVarGw(D("0"))
-    # desgin8: a naked leg only HALTs when the book is NOT confirmed flat. Leave a
-    # residual Lighter position so the rollback-flat check fails -> hard HALT.
-    eng.lighter.account_snapshot = lambda: {"positions": [{"symbol": "XAU", "qty": D("2.7")}]}
+    # desgin8: a naked leg only HALTs when the book is NOT confirmed flat. The
+    # P0-3 pre-open gate reads FLAT first (so the open proceeds), then the failed
+    # open leaves a residual Lighter position so the rollback-flat check fails
+    # -> hard HALT. Model that timeline: flat on the pre-open read, 2.7 after.
+    _snap_calls = {"n": 0}
+
+    def _stateful_snapshot():
+        _snap_calls["n"] += 1
+        qty = D("0") if _snap_calls["n"] == 1 else D("2.7")
+        return {"positions": [{"symbol": "XAU", "qty": qty}]}
+
+    eng.lighter.account_snapshot = _stateful_snapshot
     snap = {"var_price": D("4330"), "lighter_price": D("4320"),
             "live_allowed_by_units": True, "funding_verified": True}
     action = eng._do_entry("short_var_long_lighter", "t", snap)

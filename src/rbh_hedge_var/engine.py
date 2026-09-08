@@ -504,6 +504,11 @@ class Engine:
 
         executor = self._executor_for(shadow=not live)
         mode_tag = "LIVE" if live else "SHADOW"
+        # P0-3 (review23/24): a LIVE open must start from a PROVEN-flat book.
+        if live:
+            gate = self._preopen_flat_or_halt()
+            if gate is not None:
+                return gate
         self.sm.begin_entry(direction, reason)
         book = self._safe_book()
         try:
@@ -651,6 +656,14 @@ class Engine:
         # reason string produced by strategy.*_signal.
         urgent = not reason.startswith(("take_profit", "funding_spread_reversal", "max_hold"))
         result = executor.close_hedge(legs, var_price, lit_price, book, urgent=urgent)
+        # Diagnostic (review24): a close only reaches here when EVERY leg was
+        # confirmed flat (close_hedge raises ExitNotFlatError otherwise), so log
+        # the per-leg position delta that proved it — the audit trail the 9/8
+        # silent-failure chain never had.
+        deltas = ", ".join(f"{lg.get('venue')}={lg.get('close_confirmed_delta')}"
+                            for lg in result.get("legs", []))
+        if deltas:
+            self._log(f"[CLOSE CONFIRMED] {reason} | flat deltas: {deltas}")
         price_pnl = float(result.get("price_pnl") or 0)
         funding_pnl = self.sm.funding_accrued()   # P0-1: booked separately
         pnl_source = result.get("price_pnl_source")
@@ -841,6 +854,36 @@ class Engine:
                 self._log(f"[ROLLBACK] {len(orders)} resting Lighter order(s) after failed open -> HALT")
                 return False
         return True
+
+    def _preopen_flat_or_halt(self) -> str | None:
+        """P0-3 (review23/24): before opening a LIVE round, PROVE both venues are
+        flat. A silently-failed close can leave residual; opening on top of it is
+        exactly how 9/8 stacked five shorts before the rollback check caught it.
+        Read absolute positions — any non-flat leg, or an unreadable venue, HALTs
+        instead of opening (fail closed). Returns a state string when it blocks,
+        or None when the book is proven flat and the open may proceed."""
+        if self._var_gateway is None:
+            return None
+        try:
+            live = reconcile.reconcile_positions(
+                self.lighter_symbol, lighter_read=self.lighter,
+                var_gateway=self._var_gateway, var_symbol=self.var_symbol)
+        except Exception as exc:
+            reason = f"preopen_read_failed:{type(exc).__name__}"
+            if self.sm.set_halt(reason):
+                self._log(f"[PREOPEN BLOCKED] cannot verify flat before open: {exc} -> HALT")
+                self._alert(f"🛑 HALT: cannot verify both venues flat before opening ({exc}). "
+                            f"Verify venues, then `clear-halt`.")
+            return f"preopen_blocked:{type(exc).__name__}"
+        tol = self._size_step() / 2
+        residual = {k: str(v) for k, v in live.items() if abs(D(v)) > tol}
+        if residual:
+            if self.sm.set_halt("preopen_not_flat"):
+                self._log(f"[PREOPEN BLOCKED] residual position before open {residual} -> HALT")
+                self._alert(f"🛑 HALT: residual position before opening {residual} — a prior close "
+                            f"did not reach flat. Flatten manually, then `clear-halt`.")
+            return "preopen_blocked:not_flat"
+        return None
 
     def _size_step(self) -> Decimal:
         """Lighter base size step from size_decimals; fail-closed tiny fallback."""

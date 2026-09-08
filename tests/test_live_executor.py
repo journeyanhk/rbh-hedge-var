@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from rbh_hedge_var import net_guard
-from rbh_hedge_var.live_executor import LiveExecutionError, LiveExecutor, NakedLegError
+from rbh_hedge_var.live_executor import ExitNotFlatError, LiveExecutionError, LiveExecutor, NakedLegError
 from rbh_hedge_var.net_guard import WriteBlockedError
 from rbh_hedge_var.numeric import ZERO, D
 from rbh_hedge_var.shadow_executor import ShadowExecutor
@@ -508,3 +508,64 @@ def test_maker_selfcheck_fails_on_zombie_cancel():
     net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
     ok, detail = ex.maker_cancel_selfcheck("XAU", D("0.0001"))
     assert ok is False                     # cancel could not be proven clean
+
+
+# ---- review23/24 P0-1: exit flat-confirmation wall -------------------------
+class ZeroFillCloseLighter(FakeLighter):
+    """Models the 9/8 silent failure: an OPEN (sell short) fills, but every
+    buy-to-close IOC is ACKed and zero-fills — until a later retry. ``fills_after``
+    is the number of buy attempts that no-op before one finally moves position."""
+
+    def __init__(self, start_pos=D("0"), fills_after=99, entry="4320"):
+        super().__init__(entry=entry)
+        self.pos = D(start_pos)
+        self.fills_after = int(fills_after)
+        self.buy_calls = 0
+
+    def place_market_order(self, symbol, side, qty, ref_price, reduce_only=False,
+                           slippage_pct=D("0.002")):
+        self.calls.append({"symbol": symbol, "side": side, "qty": D(qty),
+                           "reduce_only": reduce_only, "slippage_pct": D(slippage_pct)})
+        if side == "buy":
+            self.buy_calls += 1
+            if self.buy_calls <= self.fills_after:
+                # ACK, but the order does not cross -> zero fill.
+                return {"venue": "lighter", "symbol": symbol, "side": side, "tx_hash": "0x0"}
+        self.pos += D(qty) if side == "buy" else -D(qty)
+        return {"venue": "lighter", "symbol": symbol, "side": side, "tx_hash": "0xlit"}
+
+
+def _short_lighter_close_legs():
+    return [
+        {"venue": "lighter", "symbol": "XAU", "side": "sell", "qty": "0.0679", "price": "4415"},
+        {"venue": "variational", "symbol": "XAU", "side": "buy", "qty": "0.0679", "price": "4415"},
+    ]
+
+
+def test_close_raises_when_lighter_never_reaches_flat():
+    # Every buy-to-close zero-fills (and the retry too) -> ExitNotFlatError, so
+    # the engine HALTs instead of booking a phantom close (the 9/8 root cause).
+    var = FakeVar(entry="4415")
+    var.pos = D("0.0679")                       # var long open
+    lit = ZeroFillCloseLighter(start_pos=D("-0.0679"), fills_after=99)  # never fills
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    with pytest.raises(ExitNotFlatError):
+        ex.close_hedge(_short_lighter_close_legs(), D("4415"), D("4415"), _BOOK, urgent=True)
+    assert lit.buy_calls >= 2                    # primary attempt + at least one retry
+
+
+def test_close_retry_reaches_flat_with_wide_slippage():
+    # Primary buy-to-close zero-fills; the ONE bounded retry (fresh price + wide
+    # slippage) crosses and flattens -> close succeeds, no raise.
+    var = FakeVar(entry="4415")
+    var.pos = D("0.0679")
+    lit = ZeroFillCloseLighter(start_pos=D("-0.0679"), fills_after=1)   # retry fills
+    ex = _exec(var, lit)
+    net_guard.disarm("I_UNDERSTAND_LIVE_TRADING")
+    out = ex.close_hedge(_short_lighter_close_legs(), D("4415"), D("4415"), _BOOK, urgent=True)
+    assert lit.pos == ZERO                       # Lighter leg reached flat
+    assert lit.buy_calls == 2                     # primary + one retry
+    # the retry used the WIDE exit slippage, not the default taker cap
+    assert lit.calls[-1]["slippage_pct"] == D(CFG["exit_retry_slippage_pct"])
+    assert isinstance(out["price_pnl"], Decimal)
